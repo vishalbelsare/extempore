@@ -1,0 +1,640 @@
+;;; xtc-typecheck.xtm --- the type phase around the constraint engine
+;;;
+;;; The inference itself lives in xtc-infer.xtm (constraint collection) and
+;;; xtc-solve.xtm (solving); run-type-check below is the whole-function entry
+;;; the driver calls.  This module keeps the phases around it: return marking,
+;;; closure conversion, var discovery, forced (source-annotated) types,
+;;; numeric coercion, and writing the resolved types back into the AST
+;;; (add-types-to-source).  The old candidate-list checker that filled this
+;;; file --- per-form *-check handlers, the union-find candidate store, the
+;;; enumeration retry loop --- is deleted (TASK-059).
+
+(define xtc:typecheck:make-uf-cell
+  (lambda (val)
+    (let ((cell (vector #f 0 val)))
+      (vector-set! cell 0 cell)
+      cell)))
+
+(xtc:cache:register-new-builtin
+  "let"
+  ""
+  "let-bind temporary variables
+
+Execute `body' with temporary variables bound as described in `bindings'.
+
+e.g.
+
+(let ((a 3)                  ;; 3 is bound to a
+      (b 42)                 ;; 42 is bound to b
+      (c:float* (alloc 10))) ;; a pointer to enough memory for 10 floats is bound to c
+  (+ a b (ftoi64 (pref c 0))))
+
+xtlang's `let' syntax is the same as Scheme"
+  '(bindings body))
+(define xtc:typecheck:run-type-check
+  (lambda (vars forced-types ast)
+    (or (xtc:infer:check-function vars forced-types ast)
+        ;; a solver conflict: the constraints are unsatisfiable
+        (xtc:diagnostics:print-could-not-resolve-type-error
+          (ast:binding-var (car (ast:let-bindings ast)))))))
+
+
+;;
+;;
+;; Other utility code
+;;
+;;
+(define xtc:typecheck:add-types-to-source-atom
+  (lambda (symname ast types envvars . prev)
+    (if (not (symbol? ast))
+        ast
+        (let ((ast-str (symbol->string ast)))
+          (cond ((and (not (string-contains? ast-str ":"))
+                      (xtc:cache:polyfunc-exists? ast-str))
+                 (let ((names (xtc:cache:get-polyfunc-candidate-names ast-str)))
+                   (if (and names (= (length names) 1))
+                       (string->symbol (car names))
+                       (xtc:diagnostics:print-compiler-error "Try forcing a type. Ambiguous polymorphic function" ast))))
+                ((string-contains? ast-str ":")
+                 (let ((p (string-split-on ast-str ":")))
+                   (cond ((xtc:cache:polyfunc-exists? (car p))
+                          (let* ((pname (car p))
+                                 (ptype-str (cadr p))
+                                 (ptype (xtc:codegen:get-type-from-pretty-str
+                                          (if (xtc:cache:typealias-exists? ptype-str)
+                                              (xtc:codegen:pretty-print-type (xtc:cache:get-typealias-type ptype-str))
+                                              ptype-str)))
+                                 (candidate (xtc:cache:get-polyfunc-candidate pname ptype)))
+                            (if candidate
+                                candidate
+                                (string->symbol (string-append pname "_adhoc_" (cname-encode (xtc:codegen:get-base-type ptype-str)))))))
+                         (else
+                           (let* ((ptrs (xtc:codegen:get-ptr-depth ast))
+                                  (gpoly? (xtc:cache:genericfunc-exists? (string->symbol (car p))))
+                                  (apoly? (xtc:cache:polyfunc-exists? (car p)))
+                                  (etype (cname-encode (xtc:codegen:get-base-type (cadr p)))))
+                             (if gpoly?
+                                 (let ((pfunc-str (string-append (car p) "_poly_" etype)))
+                                   (if (not (xtc:cache:closure-exists? pfunc-str))
+                                       (let* ((arity (xtc:codegen:get-arity-from-pretty-closure (cadr p)))
+                                              (ptypes (xtc:cache:genericfunc-types (string->symbol (car p)) arity (cadr p)))
+                                              (tmp (if (not ptypes)
+                                                       (xtc:diagnostics:print-bad-arity-error ast)))
+                                              (code (caddr (cadr (xtc:cache:genericfunc-types (string->symbol (car p)) arity (cadr p)))))
+                                              (pfunc (string->symbol pfunc-str)))
+                                         (if (not (xtc:cache:closure-exists? pfunc-str))
+                                             (xtc:cache:register-new-closure pfunc-str
+                                                                             '()
+                                                                             *xtc:globals:default-zone-size*
+                                                                             ""
+                                                                             code))
+                                         (set! code `(let ((,pfunc ,code)) ,pfunc))
+                                         (xtc:driver:run pfunc code *xtc:globals:default-zone-size* #f #f (cons pfunc (string->symbol (cadr p))))
+                                         (xtc:cache:register-new-polyfunc (car p)
+                                                                          pfunc-str
+                                                                          (xtc:codegen:get-type-from-pretty-str (cadr p))
+                                                                          "")
+                                         (xtc:bind:initialize-closure-with-new-zone pfunc-str
+                                                                                    *xtc:globals:default-zone-size*)
+                                         pfunc))
+                                   (string->symbol pfunc-str))
+                                 (if apoly?
+                                     (string->symbol (string-append (car p) "_adhoc_" etype))
+                                     (xtc:diagnostics:print-missing-identifier-error ast 'variable))))))))
+                ((and (string-contains? ast-str "##")
+                      (assq ast types)
+                      (xtc:cache:polyfunc-exists? (xtc:codegen:get-base-type ast-str)))
+                 (let* ((nm (string-split-on ast-str "##"))
+                        (n1 (car nm))
+                        (type (cdr (assq ast types)))
+                        (candidate (xtc:cache:get-polyfunc-candidate n1 type)))
+                   (if (not candidate)
+                       (xtc:diagnostics:print-compiler-error (string-append "Bad type: " (xtc:codegen:pretty-print-type type) " for polymorphic function " (car nm)) ast))
+                   candidate))
+                ((and (string-contains? ast-str "##")
+                      (assq ast types))
+                 (let* ((nm (string-split-on ast-str "##"))
+                        (n1 (car nm))
+                        (type (cdr (assq ast types)))
+                        (ptype (xtc:codegen:pretty-print-type type))
+                        (cn (cname-encode ptype))
+                        (newn (string-append n1 "_poly_" cn)))
+                   (if (not (xtc:cache:closure-exists? newn))
+                       (let* ((arity (xtc:codegen:get-arity-from-pretty-closure ptype))
+                              (ptypes (xtc:cache:genericfunc-types (string->symbol n1) arity ptype))
+                              (tmp (if (not ptypes)
+                                       (xtc:diagnostics:print-bad-arity-error ast)))
+                              (code (caddr (cadr (xtc:cache:genericfunc-types (string->symbol n1) arity ptype))))
+                              (pfunc (string->symbol newn)))
+                         (if (not (xtc:cache:closure-exists? newn))
+                             (xtc:cache:register-new-closure newn
+                                                             '()
+                                                             *xtc:globals:default-zone-size*
+                                                             ""
+                                                             code))
+                         (set! code `(let ((,pfunc ,code)) ,pfunc))
+                         (xtc:driver:run pfunc code *xtc:globals:default-zone-size* #f #f (cons pfunc (string->symbol ptype)))
+                         (xtc:cache:register-new-polyfunc n1
+                                                          newn
+                                                          (xtc:codegen:get-type-from-pretty-str ptype)
+                                                          "")
+                         (xtc:bind:initialize-closure-with-new-zone newn
+                                                                    *xtc:globals:default-zone-size*)
+                         pfunc))
+                   (string->symbol newn)))
+                (else ast))))))
+
+
+;; add types to source
+;; also add clrun for closure application
+;; and inject polymorphic functions
+(define xtc:typecheck:add-types-to-source
+  (lambda (symname ast types envvars . prev)
+    ;; (println 'symname: symname)
+    ;; (println 'ast: ast)
+    ;; (println 'types: types)
+    ;; (println 'envvars: envvars 'prev: prev)
+    (cond ((atom? ast) ;; ast
+           (apply xtc:typecheck:add-types-to-source-atom symname ast types envvars prev))
+          ((ast:closure? ast)
+           (if *xtc:diagnostics:print-work-names
+               (println '>> 'worker: (string-append (symbol->string symname) "__"
+                                                    (number->string (+ 1 (llvm:count))))))
+           (ast:make-typed-closure
+             (ast:closure-tag ast)
+             (ast:closure-alloc ast)
+             ;; global name
+             (string-append (symbol->string symname) "__" (number->string (llvm:count++)))
+             (if (or (null? prev) ;; this adds return type
+                     (not (assq (car prev) types))
+                     (null? (cdr (assq (car prev) types))))
+                 *xtc:codegen:other*
+                 (caddr (assq (car prev) types)))
+             (map (lambda (v) ;; environment types
+                    (if (member v envvars)
+                        (let ((p (assq v types)))
+                          (cons (string->symbol (string-append (symbol->string (car p)) "__sub"))
+                                (cdr p)))
+                        (assq v types)))
+                  (cons symname (ast:closure-env ast)))
+             (map (lambda (v) ;; argument types
+                    (assq v types))
+                  (ast:closure-params ast))
+             (xtc:typecheck:add-types-to-source symname (ast:closure-body ast) types
+                                                (append envvars (ast:closure-env ast)))))
+          ((ast:clrun? ast)
+           (let ((callee (ast:clrun-callee ast))
+                 (args (ast:clrun-args ast)))
+             (if (and (assq callee types)
+                      (<> (length (cdddr (assq callee types)))
+                          (length args)))
+                 (xtc:diagnostics:print-compiler-error "You must provide a full type for this call" (cons callee args)))
+             (ast:make-clrun callee
+                             (map (lambda (arg type)
+                                    (let ((a (xtc:typecheck:add-types-to-source symname arg types envvars ast)))
+                                      (if (null? type)
+                                          (xtc:diagnostics:print-could-not-resolve-type-error
+                                            (symbol->string callee))
+                                          a)))
+                                  args
+                                  (cdddr (if (not (assq callee types)) ;; if not in local env then get types from global var
+                                             (if (xtc:cache:globalvar-exists? (symbol->string callee))
+                                                 (cons callee (xtc:cache:get-globalvar-type (symbol->string callee)))
+                                                 (cons callee (xtc:cache:get-closure-type (symbol->string callee))))
+                                             (assq callee types)))))))
+          ;; environments
+          ((ast:env? ast)
+           (ast:make-env (ast:env-tag ast)
+                         (ast:env-alloc ast)
+                         (map (lambda (p)
+                                (ast:make-binding (assq (ast:binding-var p) types)
+                                                  (xtc:typecheck:add-types-to-source symname (ast:binding-expr p) types envvars
+                                                                                     (ast:binding-var p))))
+                              (ast:env-bindings ast))
+                         (xtc:typecheck:add-types-to-source symname (ast:env-body ast) types envvars)))
+          (else
+            (let ((head (ast:call-head ast))
+                  (args (ast:call-args ast)))
+              (cond
+                ;; inject (and potential compile) generic functions
+                ;; do generic functions before polys
+                ((and (symbol? head)
+                      (string-contains? (symbol->string head) "##")
+                      (xtc:cache:genericfunc-exists? (string->symbol (car (string-split-on (symbol->string head) "##")))
+                                                     (length args)))
+                 (if (or (not (assq head types))
+                         (null? (cdr (assq head types))))
+                     (xtc:diagnostics:print-could-not-resolve-generic-type-error types ast))
+                 (let* ((polyname-str (car (string-split-on (symbol->string head) "##")))
+                        (polyname (string->symbol polyname-str))
+                        (type (xtc:codegen:pretty-print-type (cdr (assq head types))))
+                        (cname (cname-encode type))
+                        (symp (string-split-on (symbol->string symname) "_poly_"))
+                        (symcname (if (null? (cdr symp)) "" (cadr symp)))
+                        (recursive? (and (string=? polyname-str (car symp))
+                                         (string=? cname symcname)))
+                        (arity (xtc:codegen:get-arity-from-pretty-closure type))
+                        (code (caddr (cadr (xtc:cache:genericfunc-types polyname arity type))))
+                        (exists (if (string=? type "") #f (xtc:cache:get-polyfunc-candidate (symbol->string polyname) (xtc:codegen:get-type-from-pretty-str type))))
+                        (typed-args (lambda ()
+                                      (map (lambda (jj)
+                                             (xtc:typecheck:add-types-to-source symname jj types envvars ast))
+                                           args))))
+                   (if (or (if exists
+                               (if (and (string-contains? (symbol->string exists) "_poly_")
+                                        (not *xtc:aot:current-output-port*)
+                                        (xtc:cache:genericfunc-src-changed polyname arity))
+                                   #f
+                                   #t)
+                               #f)
+                           recursive?)
+                       (if recursive?
+                           (ast:make-clrun symname (typed-args))
+                           (cons exists (typed-args)))
+                       (let* ((pfunc-str (string-append polyname-str "_poly_" (cname-encode type)))
+                              (pfunc (string->symbol pfunc-str)))
+                         (xtc:cache:genericfunc-src-compiled polyname arity)
+                         (if (not (xtc:cache:closure-exists? pfunc-str))
+                             (xtc:cache:register-new-closure pfunc-str
+                                                             '()
+                                                             *xtc:globals:default-zone-size*
+                                                             ""
+                                                             code))
+                         (set! code `(let ((,pfunc ,code)) ,pfunc))
+                         (xtc:driver:run pfunc code *xtc:globals:default-zone-size* #f #f (cons pfunc (string->symbol type)))
+                         (xtc:cache:register-new-polyfunc (symbol->string polyname)
+                                                          pfunc-str
+                                                          (xtc:codegen:get-type-from-pretty-str type)
+                                                          "")
+                         (xtc:bind:initialize-closure-with-new-zone pfunc-str
+                                                                    *xtc:globals:default-zone-size*)
+                         (cons pfunc (typed-args))))))
+                ;; inject polymorphic functions
+                ((and (symbol? head)
+                      (string-contains? (symbol->string head) "##"))
+                 (let* ((pname (car (string-split-on (symbol->string head) "##")))
+                        (type (cdr (assq head types)))
+                        (polyname (xtc:cache:get-polyfunc-candidate pname type)))
+                   (cons polyname
+                         (map (lambda (jj)
+                                (xtc:typecheck:add-types-to-source symname jj types envvars ast))
+                              args))))
+                ;; a call to a closure (global or local) becomes clrun->
+                ((and (symbol? head)
+                      (xtc:cache:globalvar-exists? (symbol->string head))
+                      (xtc:codegen:closure? (xtc:cache:get-globalvar-type (symbol->string head))))
+                 (xtc:typecheck:add-types-to-source symname (ast:make-clrun head args) types envvars))
+                ((and (assq head types)
+                      (xtc:codegen:closure? (cdr (assq head types))))
+                 (xtc:typecheck:add-types-to-source symname (ast:make-clrun head args) types envvars))
+                ((list? ast)
+                 (map (lambda (x)
+                        (xtc:typecheck:add-types-to-source symname x types envvars ast))
+                      ast))
+                (else (cons (apply xtc:typecheck:add-types-to-source symname (car ast) types envvars)
+                            (apply xtc:typecheck:add-types-to-source symname (cdr ast) types envvars)))))))))
+
+
+;; this is uggglly and needs to be redone!!!!!!!
+;; adds ret tags
+(define xtc:typecheck:mark-returns
+  (lambda (ast name in-body? last-pair? blocked?)
+    (cond ((atom? ast)
+           (if (and in-body? last-pair?)
+               (if blocked? ast (ast:make-ret name ast))
+               ast))
+          ((pair? ast)
+           (cond ((eq? (car ast) 'if) ;; only a source if: this pass is what makes ifret
+                  (if (or (< (length ast) 3) (> (length ast) 4))
+                      (xtc:diagnostics:print-compiler-error "Badly formed conditional" ast))
+                  ;; if statement need special syntax adjustments for returns
+                  (let ((tag (if blocked? 'if 'ifret))
+                        (then (xtc:typecheck:mark-returns (ast:if-then ast) name in-body? last-pair? blocked?)))
+                    (if (ast:if-has-else? ast)
+                        (ast:make-tagged-if tag (ast:if-test ast) then
+                                            (xtc:typecheck:mark-returns (ast:if-else ast) name in-body? last-pair? blocked?))
+                        (ast:make-tagged-if tag (ast:if-test ast) then))))
+                 ((ast:let? ast)
+                  (ast:make-let (ast:let-tag ast)
+                                (map (lambda (a)
+                                       ;; let assigns always block (lambda can override but nothing else)
+                                       (ast:make-binding (ast:binding-var a)
+                                                         (xtc:typecheck:mark-returns (ast:binding-expr a) (ast:binding-var a) #f #f #t)))
+                                     (ast:let-bindings ast))
+                                (xtc:typecheck:mark-returns (ast:let-body ast) name #t #f blocked?)))
+                 ((ast:lambda? ast)
+                  ;; lambda always unblocks because lambdas always need a return
+                  (ast:make-lambda (ast:lambda-tag ast)
+                                   (ast:lambda-params ast)
+                                   (xtc:typecheck:mark-returns (ast:lambda-body ast) name #t #f #f)))
+                 ((ast:begin? ast)
+                  (if (null? (ast:begin-exprs ast))
+                      (xtc:diagnostics:print-no-retval-error ast))
+                  (let* ((rev (reverse (ast:begin-exprs ast)))
+                         (last (car rev))
+                         (rest (reverse (cdr rev))))
+                    (ast:make-begin
+                      (append (map (lambda (a)
+                                     ;; block everything except ...
+                                     (xtc:typecheck:mark-returns a name in-body? #f #t))
+                                   rest)
+                              ;; the last one which we let through
+                              ;; ONLY if it hasn't been blocked higher up!
+                              (list (xtc:typecheck:mark-returns last name in-body?
+                                                                (if blocked? #f #t)
+                                                                blocked?))))))
+                 ((and in-body? last-pair? (not blocked?)) ;; if everything is good add a return!
+                  (ast:make-ret name (cons (ast:call-head ast)
+                                           (xtc:typecheck:mark-returns (ast:call-args ast) name in-body? #f #t))))
+                 (else (cons (xtc:typecheck:mark-returns (car ast) name in-body? #f blocked?)
+                             (xtc:typecheck:mark-returns (cdr ast) name in-body? #f blocked?))))))))
+(define xtc:typecheck:find-all-vars
+  (lambda (full-ast syms)
+    (letrec ((f (lambda (ast)
+                  (cond ((ast:closure? ast)
+                         (if (not (null? (cl:intersection (ast:closure-params ast) syms)))
+                             (xtc:diagnostics:print-shadow-var-error (car (cl:intersection (ast:closure-params ast) syms)) 'as 'a 'shadow 'variable))
+                         (set! syms (cl:remove-duplicates (append (ast:closure-env ast) (ast:closure-params ast) syms)))
+                         (f (ast:closure-body ast)))
+                        ((ast:env? ast)
+                         (set! syms
+                               (append (map (lambda (p)
+                                              (if (member (ast:binding-var p) syms)
+                                                  (xtc:diagnostics:print-shadow-var-error (ast:binding-var p)))
+                                              (ast:binding-var p))
+                                            (ast:env-bindings ast))
+                                       syms))
+                         (for-each (lambda (p)
+                                     (f (ast:binding-expr p)))
+                                   (ast:env-bindings ast))
+                         (f (ast:env-body ast)))
+                        ((pair? ast)
+                         (let ((head (ast:call-head ast))
+                               (args (ast:call-args ast)))
+                         (cond ((and (symbol? head) ;; this for generics
+                                     (string-contains? (symbol->string head) "##")
+                                     (xtc:cache:genericfunc-exists? (string->symbol (car (string-split-on (symbol->string head) "##")))
+                                                                    (length args)))
+                                (let* ((ast-str (symbol->string head))
+                                       (ast-parts (string-split-on ast-str (if (string-contains? ast-str "_poly_") "_poly_" "##")))
+                                       (gname (string->symbol (car ast-parts)))
+                                       (gnum (string->number (cadr ast-parts)))
+                                       (arity (length args))
+                                       (typestrs (cl:remove-duplicates
+                                                   (xtc:codegen:get-pretty-closure-arg-strings
+                                                     (symbol->string (car (xtc:cache:genericfunc-types gname arity #f))))))
+                                       (types (map (lambda (x) (xtc:codegen:get-type-from-pretty-str x)) typestrs))
+                                       (newsyms (cl:remove-duplicates
+                                                  (map (lambda (a b)
+                                                         ;(println 'finding: a ': b)
+                                                         (if (or (xtc:codegen:type? b)
+                                                                 (not (xtc:codegen:tuple? b)))
+                                                             #f
+                                                             (if (string-contains? a "{")
+                                                                 (string->symbol (string-append a "##" (number->string gnum)))
+                                                                 (if (string-contains? a ":")
+                                                                     (string->symbol (string-append a "##" (number->string gnum)))
+                                                                     (if (not (null? (xtc:codegen:pretty-print-type b)))
+                                                                         (string->symbol (string-append (xtc:codegen:get-base-type a)
+                                                                                                        ":"
+                                                                                                        (xtc:codegen:pretty-print-type b)
+                                                                                                        "##" (number->string gnum)))
+                                                                         #f)))))
+                                                       typestrs types)))
+                                       ;; (ll (println 'new1: newsyms))
+                                       ;; (lll (println 'tstrings: typestrs))
+                                       ;; (llll  (println 'types: types))
+                                       (gvars
+                                         (cl:remove-duplicates
+                                           (cl:remove-if-not (lambda (x)
+                                                               (and (symbol? x) (char=? (string-ref (symbol->string x) 0) #\!)))
+                                                             (flatten types))))
+                                       (newsyms_gvars (map (lambda (k)
+                                                             (string->symbol (string-append (symbol->string k) "##" (number->string gnum))))
+                                                           gvars)))
+                                  (set! syms (append syms (list head) (cl:remove #f (cl:remove-duplicates (append newsyms newsyms_gvars)))))
+                                  (f args)))
+                               ((and (symbol? head) ;; this for polys
+                                     (string-contains? (symbol->string head) "##")
+                                     (xtc:cache:get-polyfunc-candidate-types (car (string-split-on (symbol->string head) "##"))))
+                                (set! syms (append (list head) syms))
+                                (f args))
+                               (else (f (car ast))
+                                     (f (cdr ast))))))
+                        ((atom? ast) '())))))
+      (f full-ast)
+      syms)))
+(define xtc:typecheck:allocate-var?
+  (lambda (ast)
+    (cond ((null? ast) 0)
+          ((member ast '(lambda lambdaz)) 3)
+          ((eq? ast 'lambdah) 1)
+          ((eq? ast 'lambdas) 2)
+          ((pair? ast)
+           (let ((a (xtc:typecheck:allocate-var? (car ast)))
+                 (b (xtc:typecheck:allocate-var? (cdr ast))))
+             (if (> a b) a b)))
+          (else 0))))
+
+;; adds make-closure and make-env tags
+(define xtc:typecheck:closure:convert
+  (lambda (ast esyms)
+    (cond ((ast:lambda? ast)
+           (let ((allocate-mem-for-vars? (xtc:typecheck:allocate-var? (cdr ast)))
+                 (params (ast:lambda-params ast)))
+             (ast:make-closure (cond ((eq? (ast:lambda-tag ast) 'lambdah) '__make-closure-h)
+                                     ((eq? (ast:lambda-tag ast) 'lambdas) '__make-closure-s)
+                                     (else '__make-closure-z))
+                               allocate-mem-for-vars?
+                               ;; name of compiled function is always last
+                               ;; so we can remove it by dropping it off the end
+                               (cdr (reverse (cl:remove-duplicates esyms))) ;env
+                               params
+                               (xtc:typecheck:closure:convert (ast:lambda-body ast) (append params esyms)))))
+          ((ast:let? ast)
+           (let* ((allocate-mem-for-vars? (xtc:typecheck:allocate-var? ast))
+                  (bindings (map ast:binding-var (ast:let-bindings ast))))
+             (ast:make-env '__make-env
+                           allocate-mem-for-vars?
+                           (xtc:typecheck:closure:convert (ast:let-bindings ast) (append bindings esyms))
+                           (xtc:typecheck:closure:convert (ast:let-body ast) (append bindings esyms)))))
+          ((pair? ast)
+           (cons (xtc:typecheck:closure:convert (car ast) esyms)
+                 (xtc:typecheck:closure:convert (cdr ast) esyms)))
+          ((atom? ast) ast))))
+
+
+;; expects t1 (i.e. original untransformed code)
+(define xtc:typecheck:get-closure-arg-symbols
+  (lambda (closure-sym ast)
+    ;(print 'ast: ast)
+    (cond ((null? ast) '())
+          ((atom? ast) '())
+          ((vector? ast) '())
+          ((and (pair? ast)
+                (eq? (ast:call-head ast) closure-sym))
+           (let ((args (ast:call-args ast)))
+             (if (and (not (null? args))
+                      (ast:lambda? (car args)))
+                 (ast:lambda-params (car args))
+                 '())))
+          (else (append (xtc:typecheck:get-closure-arg-symbols closure-sym (car ast))
+                        (xtc:typecheck:get-closure-arg-symbols closure-sym (cdr ast)))))))
+
+
+(define xtc:typecheck:spec-new-type?
+  (lambda (x)
+    ;; (println 'newspec? x)
+    (if (and (string? x)
+             (string-contains? x "_poly_")
+             (not (xtc:cache:namedtype-exists? x)))
+        (let* ((p (string-split-on x "_poly_"))
+               (basename (substring (xtc:codegen:get-base-type x) 1
+                                    (string-length (xtc:codegen:get-base-type x))))
+               (name (substring (car p) 1 (string-length (car p))))
+               (ptrd (xtc:codegen:get-ptr-depth (cadr p)))
+               (t1 (cname-decode (xtc:codegen:get-base-type (cadr p))))
+               (t2 (xtc:codegen:get-pretty-tuple-arg-strings t1))
+               ;; (gt (xtc:cache:get-generictype-candidate-types name))
+               (t3 (xtc:desugar:maximize-generic-type
+                     (apply string-append name "{" (substring t1 1 (- (string-length t1) 1)) "}"
+                            (make-list ptrd "*"))))
+               (t3b (xtc:codegen:get-pretty-tuple-arg-strings (cadr (xtc:desugar:split-namedtype t3))))
+               (t3c (cons 14 (map (lambda (x)
+                                    (if (string? (xtc:codegen:get-type-from-pretty-str x))
+                                        (xtc:codegen:get-type-from-pretty-str x)
+                                        (if (regex:match? x (string-append "^" name "\\**"))
+                                            (xtc:codegen:add-ptr-depth (string-append "%" basename)
+                                                                       (xtc:codegen:get-ptr-depth x))
+                                            (xtc:codegen:get-type-from-pretty-str x))))
+                                  t3b)))
+               (t3d (xtc:codegen:get-type-str t3c)))
+          ;; (println 'newspec name basename t3c t3d)
+          ;; (println 'compile:
+          (if (llvm:compile-ir (string-append "%" basename " = type " t3d))
+              (begin
+                (xtc:cache:register-new-polytype name
+                                                 basename
+                                                 t3c
+                                                 "")
+                #t)
+              #f))
+        #f)))
+
+
+(define xtc:typecheck:handle-forced-types
+  (lambda (t1 . args)
+    (if (null? args) '()
+        (let* ((forced-types (map (lambda (t)
+                                    (map (lambda (tt)
+                                           ;; (println 'tt: tt)
+                                           (if (not (or (symbol? tt)
+                                                        (list? tt)))
+                                               (xtc:diagnostics:print-bad-type-error t "bad fixed type")))
+                                         (if (list? t) (cdr t) (list (cdr t))))
+                                    (cons (car t) (xtc:codegen:convert-from-pretty-types (cdr t))))
+                                  args))
+               ;; (llllll (println 'ft forced-types))
+               (forced-types-updated (apply append (list)
+                                            (map (lambda (t)
+                                                   ;; first off we might be introducing a new spec'd type here!
+                                                   (if (string? (cdr t))
+                                                       (xtc:typecheck:spec-new-type? (cdr t)))
+                                                   ;; on with the show!
+                                                   (if (and (xtc:codegen:closure? (cdr t))
+                                                            (not (null? (xtc:typecheck:get-closure-arg-symbols (car t) t1))))
+                                                       (if (<> (length (cdddr t))
+                                                               (length (xtc:typecheck:get-closure-arg-symbols (car t) t1)))
+                                                           (xtc:diagnostics:print-bad-type-error (cdr t) (car t))
+                                                           (append (map (lambda (sym type)
+                                                                          (cons sym type))
+                                                                        (xtc:typecheck:get-closure-arg-symbols (car t) t1)
+                                                                        (cdddr t))
+                                                                   (list t)))
+                                                       (list t)))
+                                                 forced-types)))
+               ;; (lllllllllllll (println 'typesupdated forced-types-updated))
+               (checked-for-duplicates (let loop ((types forced-types-updated))
+                                         (if (null? types) (cl:remove-duplicates forced-types-updated)
+                                             (if (and (assq (caar types) (cdr types))
+                                                      (not (equal? (cdr (assq (caar types) (cdr types)))
+                                                                   (cdr (car types)))))
+                                                 (xtc:diagnostics:print-type-mismatch-error
+                                                   (cdar types)
+                                                   (cdr (assq (caar types) (cdr types)))
+                                                   (caar types))
+                                                 (loop (cdr types))))))
+               (fullyqualified (cl:remove-if-not (lambda (t) (xtc:codegen:type? (cdr t))) checked-for-duplicates)))
+          ;; return fully qualified types
+          fullyqualified))))
+(define xtc:typecheck:numeric-cast-operator
+  (lambda (a b)
+    (let* ((lowest (if (< a b) a b))
+           (highest (if (= a lowest) b a))
+           (caststr (string-append (if (xtc:codegen:floating-point? highest)
+                                       (if (= highest *xtc:codegen:fp64*) "d" "f")
+                                       (xtc:codegen:pretty-print-type highest))
+                                   "to"
+                                   (if (xtc:codegen:floating-point? lowest)
+                                       (if (= lowest *xtc:codegen:fp64*) "d" "f")
+                                       (xtc:codegen:pretty-print-type lowest)))))
+      caststr)))
+
+
+;; an optional compiler stage to support some basic type coercions
+;; particular math coercions of forced types
+(define xtc:typecheck:coercion-run
+  (lambda (ast forced-types)
+    ;; (println 'ast: ast)
+    (if (pair? ast)
+        (cond ((member (ast:call-head ast) '(< > * / = + - <>))
+               (let* ((op (ast:call-head ast))
+                      (lhs (ast:call-arg ast 0))
+                      (rhs (ast:call-arg ast 1))
+                      (a (assq lhs forced-types))
+                      (b (assq rhs forced-types)))
+                 (if (and (and a b)
+                          (not (xtc:codegen:tuple? (cdr a)))
+                          (not (xtc:codegen:vector? (cdr a)))
+                          (<> (cdr a) (cdr b)))
+                     (let ((ret (string->symbol (xtc:typecheck:numeric-cast-operator (cdr a) (cdr b)))))
+                       (if (> (cdr a) (cdr b))
+                           `(,op (,ret ,lhs) ,rhs)
+                           `(,op ,lhs (,ret ,rhs))))
+                     (if (and a (number? rhs))
+                         (if (and (xtc:codegen:floating-point? (cdr a))
+                                  (integer? rhs))
+                             `(,op ,lhs ,(integer->real rhs))
+                             ast)
+                         (if (and b (number? lhs))
+                             (if (and (xtc:codegen:floating-point? (cdr b))
+                                      (integer? lhs))
+                                 `(,op ,(integer->real lhs) ,rhs)
+                                 ast)
+                             ast)))))
+              (else (cons (xtc:typecheck:coercion-run (car ast) forced-types)
+                          (xtc:typecheck:coercion-run (cdr ast) forced-types))))
+        ast)))
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define xtc:typecheck:scm_rt_check_string
+  (lambda (n closure-name)
+    (let* ((os (xtc:emit:new-buffer))
+           (n1 (substring n 1 (string-length n)))
+           (name-str (xtc:codegen:make-const-string (string-append closure-name " Scheme wrapper error: check the arg arity and types\n")))
+           (name (xtc:codegen:ssa-temp)))
+      (emit n "_bool = icmp ne i32 " n "_rt_check, 0\n" os)
+      (emit "br i1 " n "_bool, label " n "_true, label " n "_false\n" os)
+      (emit "\n" n1 "_true:\n" os)
+      (emit "br label " n "_continue\n" os)
+      (emit "\n" n1 "_false:\n" os)
+      (emit name-str os)
+      (emit "call i32 (i8*, ...) @printf(i8* " (car name) ")\n" os)
+      (emit n "_errret = call ccc i8* @mk_i64(i8* %_sc, i64 0)\n" os)
+      (emit "ret i8* " n "_errret\n" os)
+      (emit "\n" n1 "_continue:\n" os)
+      ;;(emit n " = call ccc double @r64value(i8* " n "_val)\n" os)
+      (xtc:codegen:strip-space os))))
+

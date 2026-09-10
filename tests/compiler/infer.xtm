@@ -1,0 +1,305 @@
+;;; tests/compiler/infer.xtm -- the constraint-emitting inference traversal
+;;; (runtime/xtc-infer.xtm) at expression granularity.
+;;;
+;;; The explicit assertions pin the type each expression resolves to through
+;;; xtc:infer:type-of (collect -> solve -> read-off).  The closing corpus then
+;;; cross-checks type-of against xtc:bind:get-expression-type --- the driver's
+;;; expression entry, which routes through check-function --- so the two
+;;; entry points into the same engine cannot drift apart.
+
+(sys:load "libs/core/test.xtm")
+(sys:load "runtime/xtc-solve.xtm")
+(sys:load "runtime/xtc-infer.xtm")
+
+;; Drive the traversal through the SAME wrap + desugar the driver's expression
+;; entry uses, then solve --- the expression-scoped analogue of
+;; xtc:bind:get-expression-type.
+(define infer-expr
+  (lambda (ast)
+    (let* ((c (list 'let (list (list 'xtm_exp_result ast)) 'xtm_exp_result))
+           (syn (xtc:driver:syntactic-phase 'nosuchname c))
+           (t1 (car syn)))
+      (xtc:infer:type-of t1))))
+
+;; A few monomorphic helpers so the corpus can exercise global-function
+;; application.  Each bind-func registers a single-candidate polyfunc, which is
+;; the signature the traversal reads back; their parameter and return types are
+;; chosen so the call sites below match exactly (no implicit numeric widening,
+;; which the clean unifier does not model --- see the module header).
+(bind-func infer_add_i32 (lambda (a:i32 b:i32) (+ a b)))
+(bind-func infer_is_pos  (lambda (x:double) (> x 0.0)))
+(bind-func infer_id_i64  (lambda (x:i64) x))
+
+;; An overloaded (multi-candidate) function: one i32 and one f64 instance.  A
+;; call is resolved by the argument's class --- an integer literal selects the
+;; i32 candidate, a floating-point literal the f64 candidate --- which is the
+;; overload constraint's job in the solver.
+(bind-func infer_poly:[i32,i32]*       (lambda (x) (+ x 1)))
+(bind-func infer_poly:[double,double]* (lambda (x) (* x 2.0)))
+
+;; A non-numeric operand makes a math/comparison operator dispatch to a user
+;; overload (the old path's xtm_addition## / xtm_equal## rewrite).  A minimal
+;; two-field tuple with xtm_addition and xtm_equal instances stands in for the
+;; Complexd in math.xtm (not loaded here): the operator's overload constraint
+;; carries these candidates alongside the numeric widths, and the solver selects
+;; the tuple candidate when both operands are that tuple.
+(bind-type infer_pair <double,double> (printer? . #f))
+(bind-func infer_mkpair
+  (lambda (re:double im:double)
+    (let ((c:infer_pair* (salloc)))
+      (tset! c 0 re)
+      (tset! c 1 im)
+      (pref c 0))))
+(bind-func xtm_addition
+  (lambda (a:infer_pair b:infer_pair)
+    (infer_mkpair (+ (tref a 0) (tref b 0))
+                  (+ (tref a 1) (tref b 1)))))
+(bind-func xtm_equal
+  (lambda (a:infer_pair b:infer_pair)
+    (and (= (tref a 0) (tref b 0))
+         (= (tref a 1) (tref b 1)))))
+
+;; Generic functions whose return type is REIFIED from the arguments: the
+;; bang-variable signature instantiates through the overload by unification
+;; (identity reifies the result from its one argument; "first of two" from its
+;; first).  Named generic types follow below.
+(bind-func infer_gid:[!a,!a]*       (lambda (x) x))
+(bind-func infer_gfirst:[!a,!a,!b]* (lambda (x y) x))
+
+;; Named generic types: a concrete instance is an opaque poly c-name, a
+;; candidate's pattern is Name{!a,...}; the int-code bridge decodes BOTH to a
+;; nominal (napp name arg...) term, so an accessor reifies its return by
+;; unification and distinct same-shaped types do not cross-match.  IBox is a
+;; single specialisation; gfirst/gsecond add the multi-specialisation case ---
+;; gfirst's fully-general [!a,!b]* fallback (a free return) is filtered out,
+;; leaving the IPair specialisation to reify.
+(bind-type IBox <!a,i64>)
+(bind-func ibox_get:[!a,IBox{!a}*]* (lambda (b) (tref b 0)))
+(bind-func mk_ibox:[IBox{!a}*,!a]*
+  (lambda (x) (let ((b:IBox{!a}* (halloc))) (tset! b 0 x) b)))
+(bind-type IPair <!a,!b>)
+(bind-func gfirst:[!a,!b]*           (lambda (a) (tref a 0)))
+(bind-func gfirst:[!a,IPair{!a,!b}*]*  (lambda (a) (tref a 0)))
+(bind-func gsecond:[!a,!b]*            (lambda (a) (tref a 1)))
+(bind-func gsecond:[!b,IPair{!a,!b}*]* (lambda (a) (tref a 1)))
+
+;; A FREE-RETURN fallback ([!a,!b]*, return bound nowhere in the parameters) is
+;; reified by exercising its body --- a field projection (tref a i) --- against
+;; the concrete argument type, the structural analogue of the old path's
+;; "exercise the generic code".  gfirst/gsecond above carry that fallback; below,
+;; a plain (non-generic) tuple type stands in for an argument that matches NO
+;; specialisation, so only the fallback applies.  Calls over a napp instance
+;; (IList, Gx) reuse the same projection through the nominal bridge.
+(bind-type bare2 <i64,double>)
+(bind-func mk_bare2:[bare2*,i64,double]*
+  (lambda (x y) (let ((b:bare2* (halloc))) (tset! b 0 x) (tset! b 1 y) b)))
+
+;; Nominal disambiguation: Gx{!a} (<!a,double>) and Gy{!a,!b} (<!a,!b>) have the
+;; SAME shape, and gpick has a specialisation for each returning a DIFFERENT
+;; field.  A Gx argument must select the Gx specialisation (field 0 = the
+;; element) --- a structural decode would cross-match Gy and return field 1
+;; (double).  This is the case that makes the nominal representation necessary.
+(bind-type Gx <!a,double>)
+(bind-type Gy <!a,!b>)
+(bind-func gpick:[!a,Gx{!a}*]*       (lambda (g) (tref g 0)))
+(bind-func gpick:[!b,Gy{!a,!b}*]*    (lambda (g) (tref g 1)))
+(bind-func mk_gx:[Gx{!a}*,!a]*
+  (lambda (x) (let ((g:Gx{!a}* (halloc))) (tset! g 0 x) g)))
+
+;; A RECURSIVE generic type (IList references itself); the name carries the
+;; recursion, so the nominal term needs no expansion and the accessor reifies.
+;; ilist_cons RETURNS the generic instance --- the reified napp result reads back
+;; as the same poly c-name the old path produces (the bridge re-encode).
+(bind-type IList <!a,IList*>)
+(bind-func ilist_head:[!a,IList{!a}*]* (lambda (l) (tref l 0)))
+(bind-func mk_ilist:[IList{!a}*,!a]*
+  (lambda (x) (let ((l:IList{!a}* (halloc))) (tset! l 0 x) l)))
+(bind-func ilist_cons:[IList{!a}*,!a,IList{!a}*]*
+  (lambda (x l) (let ((n:IList{!a}* (halloc))) (tset! n 0 x) (tset! n 1 l) n)))
+(bind-func mk_ipair:[IPair{!a,!b}*,!a,!b]*
+  (lambda (x y) (let ((p:IPair{!a,!b}* (halloc))) (tset! p 0 x) (tset! p 1 y) p)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; explicit types      ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A handful pinned directly, so the file documents the expected outcomes (codes:
+;; 2 = i64, 0 = f64, 10 = i1).
+(xtmtest-result (infer-expr 42)                          2  "int-literal")
+(xtmtest-result (infer-expr 4.0)                         0  "float-literal")
+(xtmtest-result (infer-expr #t)                          10 "bool-literal")
+(xtmtest-result (infer-expr '(+ 1 2))                    2  "math-int")
+(xtmtest-result (infer-expr '(+ 1.0 2.0))                0  "math-float")
+(xtmtest-result (infer-expr '(if #t 1 2))                2  "if-branches")
+(xtmtest-result (infer-expr '(let ((x:i64 1)) x))        2  "let-bound-var")
+(xtmtest-result (infer-expr '(let ((x:i64 1)) (+ x 2)))  2  "let-then-use")
+(xtmtest-result (infer-expr '(< 1 2))                    10 "compare-int")
+(xtmtest-result (infer-expr '(if (< 1 2) 3 4))           2  "compare-in-if")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; lambdas and calls   ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A lambda's type is the closure (213 ret arg...).  A bare lambda only resolves
+;; when the body pins every parameter --- here the literal 1 fixes x at i64.  A
+;; lambda with a parameter the body never constrains stays generic and type-of
+;; declines it (#f), so such lambdas are deliberately kept out of the parity
+;; corpus below (generalising them is a later increment).
+(xtmtest-result (infer-expr '(lambda (x:i64) (+ x 1)))   '(213 2 2) "lambda-pinned")
+(xtmtest-result (infer-expr '(lambda () 42))             '(213 2)   "lambda-no-arg")
+
+;; Applying a local closure resolves through the call's argument types: the
+;; literal 5 flows into the parameter and the return type flows back out.
+(xtmtest-result (infer-expr '(let ((f (lambda (x:i64) (+ x 1)))) (f 5)))     2  "call-monomorphic")
+(xtmtest-result (infer-expr '(let ((h (lambda (x:i64) (< x 0)))) (h 5)))     10 "call-returns-bool")
+(xtmtest-result (infer-expr '(let ((f (lambda () 42))) (f)))                 2  "call-no-arg")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; global application  ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A call to a global function reads its single signature: arguments unify with
+;; the parameter types (forcing the literals) and the result is the return type.
+(xtmtest-result (infer-expr '(infer_add_i32 1 2))                      4  "global-call-i32")
+(xtmtest-result (infer-expr '(infer_is_pos 1.0))                       10 "global-call-bool")
+(xtmtest-result (infer-expr '(infer_id_i64 5))                         2  "global-call-i64")
+(xtmtest-result (infer-expr '(infer_add_i32 (infer_add_i32 1 2) 3))    4  "global-call-nested")
+
+;; An overloaded call resolves to the candidate the argument's class selects.
+(xtmtest-result (infer-expr '(infer_poly 5))                           4  "overload-selects-i32")
+(xtmtest-result (infer-expr '(infer_poly 5.0))                         0  "overload-selects-f64")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; tuple operands      ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A math/comparison operator on tuple operands dispatches to its user overload:
+;; (+ pair pair) selects the xtm_addition candidate and carries the tuple type;
+;; (= pair pair) selects xtm_equal and still returns i1.  A named tuple resolves
+;; to its string code ("%infer_pair"); booleans are i1 = 10.
+(xtmtest-result (infer-expr '(+ (infer_mkpair 1.0 2.0) (infer_mkpair 3.0 4.0))) "%infer_pair" "tuple-addition")
+(xtmtest-result (infer-expr '(= (infer_mkpair 1.0 2.0) (infer_mkpair 3.0 4.0))) 10            "tuple-equal-returns-bool")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; generic functions   ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A generic call reifies its return type from the arguments by unification ---
+;; the same overload constraint, only its candidate carries bang variables.
+(xtmtest-result (infer-expr '(infer_gid 5))         2 "generic-identity-i64")
+(xtmtest-result (infer-expr '(infer_gid 5.0))       0 "generic-identity-f64")
+(xtmtest-result (infer-expr '(infer_gfirst 5 6.0))  2 "generic-first-of-two")
+
+;; Named-type generics: a generic accessor over a generic-type instance reifies
+;; its return through the nominal (napp) bridge decode.
+(xtmtest-result (infer-expr '(ibox_get (mk_ibox 5)))      2 "named-generic-single-spec")
+(xtmtest-result (infer-expr '(ibox_get (mk_ibox 5.0)))    0 "named-generic-single-spec-f64")
+(xtmtest-result (infer-expr '(gfirst (mk_ipair 5 6.0)))   2 "named-generic-multi-spec-first")
+(xtmtest-result (infer-expr '(gsecond (mk_ipair 5 6.0)))  0 "named-generic-multi-spec-second")
+;; nominal disambiguation (would be double=0 under a structural decode) and a
+;; recursive generic type
+(xtmtest-result (infer-expr '(gpick (mk_gx 5)))           2 "named-generic-nominal-disambiguation")
+(xtmtest-result (infer-expr '(ilist_head (mk_ilist 7)))   2 "named-generic-recursive-i64")
+(xtmtest-result (infer-expr '(ilist_head (mk_ilist 7.0))) 0 "named-generic-recursive-f64")
+;; a generic that RETURNS its generic instance: the head of a consed list still
+;; reduces to the element scalar
+(xtmtest-result (infer-expr '(ilist_head (ilist_cons 8 (mk_ilist 9)))) 2 "named-generic-container-return")
+
+;; free-return fallback: no specialisation matches, so the [!a,!b]* fallback is
+;; reified by projecting its body's field (tref a i) against the concrete tuple.
+;; A plain named tuple, then nominal (napp) instances; field 0 and field 1.
+(xtmtest-result (infer-expr '(gfirst (mk_bare2 5 6.0)))   2 "free-return-named-field0")
+(xtmtest-result (infer-expr '(gsecond (mk_bare2 5 6.0)))  0 "free-return-named-field1")
+(xtmtest-result (infer-expr '(gfirst (mk_ilist 7)))       2 "free-return-napp-i64")
+(xtmtest-result (infer-expr '(gfirst (mk_ilist 7.0)))     0 "free-return-napp-f64")
+(xtmtest-result (infer-expr '(gfirst (mk_gx 5)))          2 "free-return-napp-gx")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; entry-point parity  ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The corpus cross-checks the expression-scoped type-of against the driver's
+;; expression entry (get-expression-type, through check-function); the test
+;; returns the expressions on which the two disagree, so an empty result
+;; certifies parity and a failure names the divergence.
+(xtmtest-result
+  (let ((corpus (list 0 1 42 99 4.0 1.5
+                      '(+ 1 2) '(* 3 4) '(- 10 5)
+                      '(+ 1.0 2.0) '(* 2.0 3.0)
+                      '(if #t 1 2) '(if #f 5 6)
+                      '(let ((x:i64 1)) x)
+                      '(let ((x:i64 1) (y:i64 2)) (+ x y))
+                      '(let ((x:i64 1)) (+ x 2))
+                      '(begin 1 2 3)
+                      '(< 1 2) '(> 3 4) '(= 5 5)
+                      '(if (< 1 2) 3 4)
+                      '(let ((x:i64 1)) (< x 2))
+                      ;; lambdas (every parameter pinned by the body) and the
+                      ;; application of a local closure
+                      '(lambda (x:i64) (+ x 1))
+                      '(lambda () 42)
+                      '(let ((f (lambda (x:i64) (+ x 1)))) (f 5))
+                      '(let ((g (lambda (a:double b:double) (+ a b)))) (g 1.0 2.0))
+                      '(let ((h (lambda (x:i64) (< x 0)))) (h 5))
+                      '(let ((f (lambda (x:i64) (+ x 1)))) (+ (f 5) (f 6)))
+                      '(let ((f (lambda () 42))) (f))
+                      '(let ((f (lambda (x:i64) (+ x 1)))) (let ((y:i64 (f 3))) (+ y 1)))
+                      ;; global-function application (single known signature),
+                      ;; including a global call nested inside other forms
+                      '(infer_add_i32 1 2)
+                      '(infer_is_pos 1.0)
+                      '(infer_id_i64 5)
+                      '(infer_add_i32 (infer_add_i32 1 2) 3)
+                      '(if (infer_is_pos 2.0) 1 0)
+                      '(+ (infer_add_i32 1 2) (infer_add_i32 3 4))
+                      '(let ((r:i32 (infer_add_i32 1 2))) (infer_add_i32 r 4))
+                      ;; overloaded (multi-candidate) application, resolved by the
+                      ;; argument's class, and composed with the other forms
+                      '(infer_poly 5)
+                      '(infer_poly 5.0)
+                      '(+ (infer_poly 3) (infer_poly 4))
+                      '(if (infer_is_pos 1.0) (infer_poly 2) (infer_poly 3))
+                      '(let ((f (lambda (x:i64) (+ x 1)))) (infer_id_i64 (f 5)))
+                      ;; math / comparison on tuple operands, dispatched to the
+                      ;; user xtm_addition / xtm_equal overload
+                      '(+ (infer_mkpair 1.0 2.0) (infer_mkpair 3.0 4.0))
+                      '(= (infer_mkpair 1.0 2.0) (infer_mkpair 3.0 4.0))
+                      ;; generic functions, return type reified from the arguments
+                      '(infer_gid 5)
+                      '(infer_gid 5.0)
+                      '(infer_gid (infer_gid 7))
+                      '(infer_gfirst 5 6.0)
+                      '(infer_gfirst 5.0 6)
+                      '(+ (infer_gid 3) (infer_gid 4))
+                      ;; named-type generics (accessor over a generic instance),
+                      ;; reducing to a scalar, composed with math / comparison
+                      '(ibox_get (mk_ibox 5))
+                      '(ibox_get (mk_ibox 5.0))
+                      '(gfirst (mk_ipair 5 6.0))
+                      '(gsecond (mk_ipair 5 6.0))
+                      '(+ (ibox_get (mk_ibox 3)) (ibox_get (mk_ibox 4)))
+                      '(if (< (gfirst (mk_ipair 1 2.0)) 5) 10 20)
+                      ;; nominal disambiguation and a recursive generic type
+                      '(gpick (mk_gx 5))
+                      '(ilist_head (mk_ilist 7))
+                      '(ilist_head (mk_ilist 7.0))
+                      '(+ (ilist_head (mk_ilist 3)) (ilist_head (mk_ilist 4)))
+                      ;; a generic that RETURNS its generic instance: the reified
+                      ;; napp reads back as the same poly c-name the old path emits
+                      '(ilist_cons 8 (mk_ilist 9))
+                      '(ilist_head (ilist_cons 8 (mk_ilist 9)))
+                      ;; free-return fallback ([!a,!b]*) reified by body projection
+                      ;; when no specialisation matches: a plain named tuple, nominal
+                      ;; (napp) instances, field 0 and field 1, and composed
+                      '(gfirst (mk_bare2 5 6.0))
+                      '(gsecond (mk_bare2 5 6.0))
+                      '(gfirst (mk_ilist 7))
+                      '(gfirst (mk_ilist 7.0))
+                      '(gfirst (mk_gx 5))
+                      '(+ (gfirst (mk_bare2 3 6.0)) (gfirst (mk_bare2 4 6.0)))
+                      '(if (< (gfirst (mk_bare2 1 2.0)) 5) 10 20))))
+    (cl:remove-if
+      (lambda (e) (equal? (infer-expr e) (xtc:bind:get-expression-type e)))
+      corpus))
+  '()
+  "infer-entry-point-parity")

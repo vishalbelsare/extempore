@@ -1,0 +1,794 @@
+;;; xtc-solve.xtm --- constraint solving over the canonical type core
+;;;
+;;; This module is the inference *engine*: it consumes a list of type
+;;; constraints and produces a substitution, from which each program
+;;; variable's resolved type can be read back.  It sits above the canonical
+;;; representation (xtc-types.xtm) and its int-code boundary (xtc-types-bridge.xtm),
+;;; and it replaced the old candidate-list collapse (the xtc:desugar unifier
+;;; family) plus the enumeration retry loop in run-type-check* (both deleted ---
+;;; TASK-059).
+;;;
+;;; The old solver stored, per program variable, a *list* of candidate types in
+;;; a union-find cell, then collapsed that list with a pile of heuristics.  The
+;;; list conflated three genuinely different things:
+;;;
+;;;   - equality      two uses assert the variable has the same type      -> unify
+;;;   - default       a bare literal could be any of several widths       -> default rule
+;;;   - overload      a poly symbol has several candidate signatures      -> choose (elsewhere)
+;;;
+;;; This engine separates them.  Equality is Robinson unification of two
+;;; canonical terms, threaded as one substitution; the number-crunch
+;;; tie-breaking disappears because genuinely-equal things simply unify and
+;;; genuinely-distinct things are a type error rather than a retained "union".
+;;; Numeric defaulting becomes one explicit rule applied *after* unification:
+;;; an unconstrained numeric variable takes the head (the minimal code, by the
+;;; xtc-globals ordering fp64<fp32<si64<...) of its candidate class.  Because
+;;; unification has already propagated every downstream constraint into the
+;;; variable, a literal whose width is fixed by a later use is no longer free,
+;;; so the default does not fire --- which is exactly the case the old
+;;; backtracking enumeration existed to rescue.
+;;;
+;;; Constraints speak the live int-code representation (2, 102, (14 2 0),
+;;; "%string", !a, ...) so the traversal that emits them needs no new vocabulary;
+;;; the bridge interns every symbol (program variable or !bang type variable)
+;;; to a canonical type variable, sharing one intern table across the whole
+;;; solve so that two occurrences of a name --- and !a versus !a* --- denote the
+;;; same variable at the same or differing pointer depth.
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; constraints         ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A constraint is a tagged list.  Three kinds:
+;;
+;;   (eq lhs rhs)        lhs and rhs (each an int-code type or a variable
+;;                       symbol) denote the same type; unify them.  A user
+;;                       signature is just an eq processed like any other ---
+;;                       Robinson makes it rigid for free, since once the
+;;                       variable is bound to a concrete type a conflicting eq
+;;                       fails rather than silently widening.
+;;
+;;   (default sym class) if sym is still unbound after all equalities, bind it
+;;                       to the default member of `class' (a list of candidate
+;;                       int-codes, default = minimum by the globals ordering).
+;;
+;;   (overload result args cands)
+;;                       a call whose callee has several candidate signatures
+;;                       (each an int-code closure (head ret p...)): result and
+;;                       args (lists of int-code keys) must unify with the
+;;                       return and parameter types of exactly one candidate.
+;;                       This is the deferred choice --- it cannot always be
+;;                       decided in one pass, so the solver commits a candidate
+;;                       only once it is the unique viable one (see below).
+;;
+;;   (project result agg index)
+;;                       result is field `index' of the aggregate `agg' (a
+;;                       tuple-ref / array-ref / vector-ref): once agg resolves to
+;;                       a concrete aggregate type (a tuple, array or vector,
+;;                       possibly under a pointer, or a named / nominal type that
+;;                       expands to one) the field's type is read off and unified
+;;                       with result.  Like an overload it is deferred --- it
+;;                       cannot fire until agg is known --- and discharged in the
+;;                       same fixpoint.
+
+(define xtc:solve:c-eq
+  (lambda (lhs rhs) (list 'eq lhs rhs)))
+
+(define xtc:solve:c-default
+  (lambda (sym class) (list 'default sym class)))
+
+;; `cands' is a list of candidate signatures, each the int-code list
+;; (return-type param-type ...) --- i.e. the cdr of a closure int-code.
+(define xtc:solve:c-overload
+  (lambda (result args cands) (list 'overload result args cands)))
+
+;; result is field `index' (a literal) of aggregate key `agg'.
+(define xtc:solve:c-project
+  (lambda (result agg index) (list 'project result agg index)))
+
+;; result is what the zero-argument application (head) evaluates to: the return
+;; type when `head' resolves to a closure, the value itself otherwise --- the
+;; old checker's leniency for code that calls a plain value ((if (FM) ...) over
+;; an i1 local), which library code relies on.  Deferred like a projection,
+;; because which reading applies is unknowable until `head' grounds.
+(define xtc:solve:c-callval
+  (lambda (result head) (list 'callval result head)))
+
+;; result is what the generic `sym' returns for the argument keys `args' when
+;; its signature cannot reify the return (a free-return fallback whose body is
+;; not a plain field accessor --- the expression problem's eval:[!a,Add*]*
+;; summing two recursive evals).  Deferred until every argument grounds; then
+;; xtc-infer exercises the fallback's body against those types (through
+;; *xtc:solve:exercise-hook*) and result unifies with what the body returned.
+(define xtc:solve:c-exercise
+  (lambda (result sym arity args) (list 'exercise result sym arity args)))
+
+;; The body exerciser xtc-infer installs (it loads after this module):
+;; (lambda (sym arity argterms)) -> the return's int-code, or #f when the body
+;; cannot be exercised (no fallback accepts the arguments, or this very
+;; exercise is already in progress --- a self-recursive generic).
+(define *xtc:solve:exercise-hook* #f)
+
+(define xtc:solve:eq? (lambda (c) (eq? (car c) 'eq)))
+(define xtc:solve:default? (lambda (c) (eq? (car c) 'default)))
+(define xtc:solve:overload? (lambda (c) (eq? (car c) 'overload)))
+(define xtc:solve:project? (lambda (c) (eq? (car c) 'project)))
+(define xtc:solve:callval? (lambda (c) (eq? (car c) 'callval)))
+(define xtc:solve:exercise? (lambda (c) (eq? (car c) 'exercise)))
+(define xtc:solve:deferred?
+  (lambda (c) (or (xtc:solve:project? c) (xtc:solve:callval? c) (xtc:solve:exercise? c))))
+
+;; WHY the last solve conflicted, for the error path: the deferred and
+;; overload passes leave a procedure here that prints the failing constraint in
+;; the terms of the substitution it failed under, and explain-conflict runs it
+;; when no single equality accounts for the conflict.  A procedure, not a
+;; string: the search backtracks through many conflicts, so the rendering is
+;; paid only when a diagnostic is actually printed.
+;;
+;; It takes `ground', which extends a substitution with the numeric defaults,
+;; and must render every type through it --- the substitution of the moment
+;; leaves a literal argument as an unresolved variable, so a wrong-argument-
+;; type error would read [!infer_1] where the reader wants [double].
+(define *xtc:solve:conflict-why* #f)
+
+(define xtc:solve:conflict!
+  (lambda (why)
+    (set! *xtc:solve:conflict-why* why)
+    'conflict))
+
+(define xtc:solve:pretty-key
+  (lambda (k intern subst)
+    (xtc:type:to-pretty (xtc:type:apply-subst (xtc:type:from-intcode k intern) subst) intern)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; solving             ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Solve over one substitution.  First unify every equality; a single failure
+;; collapses the whole solve to the symbol 'conflict (the honest report that the
+;; program is ill-typed --- the old path would have retained an unresolvable
+;; union and limped on).  Then discharge overloads and defaults together (see
+;; xtc:solve:resolve): forward propagation from the equalities has already fixed
+;; whatever it can, so an overload whose arguments are now concrete resolves to
+;; its one viable candidate without any search.
+;;
+;; `intern' is a caller-supplied hashtable; the same table must be handed to
+;; xtc:solve:type-of afterwards so that a variable's identity at read-back
+;; matches the one used here.
+(define xtc:solve:run
+  (lambda (constraints intern)
+    (set! *xtc:solve:conflict-why* #f)
+    (let ((subst (xtc:solve:unify-equalities constraints intern)))
+      (if (eq? subst 'conflict)
+          'conflict
+          (xtc:solve:resolve constraints intern subst)))))
+
+;; Render a candidate signature (an int-code list: return, params...) the way a
+;; closure type prints, "[ret,param,...]", resolved as far as the substitution
+;; allows.
+(define xtc:solve:pretty-sig
+  (lambda (intcodes intern subst)
+    (string-append
+      "[" (xtc:type:to-pretty-list
+            (map (lambda (k) (xtc:type:apply-subst
+                               (xtc:type:from-intcode k intern) subst))
+                 intcodes)
+            intern)
+      "]")))
+
+;; A conflict's WHY, for the error path only (the solve itself stays silent):
+;; replay the equalities one at a time, reporting the first that fails as a
+;; readable type mismatch; or, when no single equality fails, print the reason
+;; the resolve recorded (the projection, call-or-value read, exercised
+;; generic, or overload that failed under the substitution of the moment, or
+;; the search's exhaustion) --- and failing even that, report each overloaded
+;; call whose argument types match none of its candidates.  These messages
+;; precede the driver's "couldn't resolve type: NAME" line, which says which
+;; definition failed --- this line says why.
+(define xtc:solve:explain-conflict
+  (lambda (constraints intern)
+    (let loop ((cs constraints) (subst xtc:type:empty-subst))
+      (cond
+        ((null? cs)
+         (if *xtc:solve:conflict-why*
+             (*xtc:solve:conflict-why*
+               (lambda (s) (xtc:solve:apply-defaults constraints intern s)))
+             ;; apply numeric defaults first so a literal argument renders as
+             ;; its concrete type (double/i64) rather than an unresolved
+             ;; variable
+             (let* ((subst (xtc:solve:apply-defaults constraints intern subst))
+                    (classes (xtc:solve:class-map constraints)))
+               (for-each
+                 (lambda (c)
+                   (if (null? (xtc:solve:overload-viable c intern subst classes))
+                       (xtc:solve:print-no-overload c intern subst)))
+                 (cl:remove-if-not xtc:solve:overload? constraints)))))
+        ((xtc:solve:eq? (car cs))
+         (let* ((c (car cs))
+                (t1 (xtc:type:from-intcode (cadr c) intern))
+                (t2 (xtc:type:from-intcode (caddr c) intern))
+                (subst2 (xtc:type:unify t1 t2 subst)))
+           (if subst2
+               (loop (cdr cs) subst2)
+               (print
+                 (string-append
+                   "Type Error: type mismatch --- "
+                   (xtc:type:to-pretty (xtc:type:apply-subst t1 subst) intern)
+                   " is not compatible with "
+                   (xtc:type:to-pretty (xtc:type:apply-subst t2 subst) intern)
+                   "\n")))))
+        (else (loop (cdr cs) subst))))))
+
+(define xtc:solve:print-no-overload
+  (lambda (c intern subst)
+    (print
+      (string-append
+        "Type Error: no overload matches the argument types "
+        (xtc:solve:pretty-sig (caddr c) intern subst)
+        " --- candidates are "
+        (string-join
+          (map (lambda (sig)
+                 (if (symbol? sig)
+                     (symbol->string sig)
+                     (xtc:solve:pretty-sig sig intern subst)))
+               (cadddr c))
+          " ")
+        "\n"))))
+
+(define xtc:solve:unify-equalities
+  (lambda (constraints intern)
+    (let loop ((cs constraints) (subst xtc:type:empty-subst))
+      (cond ((null? cs) subst)
+            ((xtc:solve:eq? (car cs))
+             (let* ((c (car cs))
+                    (t1 (xtc:type:from-intcode (cadr c) intern))
+                    (t2 (xtc:type:from-intcode (caddr c) intern))
+                    (subst2 (xtc:type:unify t1 t2 subst)))
+               (if subst2
+                   (loop (cdr cs) subst2)
+                   'conflict)))
+            (else (loop (cdr cs) subst))))))
+
+(define xtc:solve:apply-defaults
+  (lambda (constraints intern subst)
+    (let loop ((cs constraints) (subst subst))
+      (cond ((null? cs) subst)
+            ((xtc:solve:default? (car cs))
+             (let* ((c (car cs))
+                    (var (xtc:type:from-intcode (cadr c) intern))
+                    (resolved (xtc:type:resolve var subst)))
+               ;; only a still-free variable defaults; one already pinned by a
+               ;; downstream equality keeps the width that use demanded
+               (if (xtc:type:var? resolved)
+                   (let* ((default-code (apply min (caddr c)))
+                          (subst2 (xtc:type:unify
+                                    resolved
+                                    (xtc:type:from-intcode default-code intern)
+                                    subst)))
+                     (loop (cdr cs) (if subst2 subst2 subst)))
+                   (loop (cdr cs) subst))))
+            (else (loop (cdr cs) subst))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; overloads           ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The class (the candidate int-codes of a default constraint) each defaultable
+;; key ranges over, as an alist key -> class gathered from the default
+;; constraints.  This is the bound a bare literal carries; overload resolution
+;; reads it so a literal can match a candidate at any width in its class, not
+;; only at the width defaulting would eventually choose.
+(define xtc:solve:class-map
+  (lambda (constraints)
+    (cl:remove #f
+               (map (lambda (c)
+                      (if (xtc:solve:default? c) (cons (cadr c) (caddr c)) #f))
+                    constraints))))
+
+;; The vector-math rule: the old math-check lets a binary operator combine a
+;; SIMD vector with a vector of the same base type at either pointer depth
+;; ("we are allowed to multiply a Vector by a Vector*"), the result being the
+;; VALUE vector (math always returns a non-pointer vector).  A structural rule,
+;; not a fixed signature, so it rides the overload as the marker candidate
+;; `vecmath: viable only once some argument has resolved to a vector or vector
+;; pointer --- and a grounded vector argument kills every numeric candidate, so
+;; the marker is then the unique survivor the commit pass picks.  On commit the
+;; other operand takes the base (value) vector if still free, or must share
+;; the base if grounded, and the result is the base vector.
+(define xtc:solve:vecmath-base
+  (lambda (t)
+    (cond ((xtc:type:vector? t) t)
+          ((and (xtc:type:ptr? t) (xtc:type:vector? (xtc:type:ptr-to t)))
+           (xtc:type:ptr-to t))
+          (else #f))))
+
+;; The pointer-comparison rule: the old math/compare check lets (= p q) and
+;; friends compare two pointers of one type, the result i1.  Like vecmath it
+;; rides the overload as a structural marker, viable only once some operand
+;; has resolved to a pointer (so it never holds a numeric compare ambiguous);
+;; the other operand then takes the same pointer type.
+(define xtc:solve:ptrcmp-viable
+  (lambda (rkey akeys intern subst)
+    (let* ((terms (map (lambda (k)
+                         (xtc:type:apply-subst (xtc:type:from-intcode k intern) subst))
+                       akeys))
+           (anchor (cl:find-if xtc:type:ptr? terms)))
+      (and anchor
+           (let loop ((ts terms)
+                      (s (xtc:type:unify (xtc:type:from-intcode rkey intern)
+                                         (xtc:type:from-intcode *xtc:codegen:i1* intern)
+                                         subst)))
+             (cond ((not s) #f)
+                   ((null? ts) (cons 'ptrcmp s))
+                   (else (loop (cdr ts) (xtc:type:unify (car ts) anchor s)))))))))
+
+(define xtc:solve:vecmath-viable
+  (lambda (rkey akeys intern subst)
+    (let* ((terms (map (lambda (k)
+                         (xtc:type:apply-subst (xtc:type:from-intcode k intern) subst))
+                       akeys))
+           (bases (map xtc:solve:vecmath-base terms))
+           (base (cl:find-if (lambda (b) b) bases)))
+      (if (not base)
+          #f
+          (let loop ((ts terms) (bs bases)
+                     (s (xtc:type:unify (xtc:type:from-intcode rkey intern) base subst)))
+            (cond ((not s) #f)
+                  ((null? ts) (cons 'vecmath s))
+                  ((car bs)  ;; grounded vector(-ptr): bases must agree
+                   (loop (cdr ts) (cdr bs) (xtc:type:unify (car bs) base s)))
+                  (else      ;; still free (or must unify with the value vector)
+                        (loop (cdr ts) (cdr bs) (xtc:type:unify (car ts) base s)))))))))
+
+;; The class alist with each key resolved to its canonical representative under
+;; `subst': (rep . class) ...  This is a pure function of (classes, intern,
+;; subst), and overload-viable needs it on every call --- but across a
+;; commit-pass sweep, and across the most-constrained selection in the search,
+;; every overload is tested against the SAME subst object, so resolving all the
+;; function's default-constraint keys was redone once per overload (1.7M resolves
+;; over instruments.xtm) when the result changes only when subst does.  A
+;; single-entry cache keyed on the identities of all three inputs collapses that
+;; to one rebuild per distinct substitution.  Safety: classes and intern are one
+;; object each per solve, so a stale empty-subst '() carried over from a previous
+;; solve cannot match (its classes/intern differ); within a solve the rep list is
+;; read-only, so sharing it across overloads is sound.
+(define *xtc:solve:class-reps-cache* #f)
+
+(define xtc:solve:class-reps
+  (lambda (classes intern subst)
+    (let ((c *xtc:solve:class-reps-cache*))
+      (if (and c (eq? (car c) subst) (eq? (cadr c) classes) (eq? (caddr c) intern))
+          (cadddr c)
+          (let ((reps (map (lambda (cl)
+                             (cons (xtc:type:resolve
+                                     (xtc:type:from-intcode (car cl) intern) subst)
+                                   (cdr cl)))
+                           classes)))
+            (set! *xtc:solve:class-reps-cache* (list subst classes intern reps))
+            reps)))))
+
+;; The candidates of overload `c' that unify with its result and argument keys
+;; under `subst', each paired with the substitution that unifying it produces:
+;; ((candidate . subst2) ...).  A candidate is the int-code signature (ret p...);
+;; its own type variables are interned through a FRESH table so they instantiate
+;; independently of the call site and of the other candidates --- the principled
+;; freshening a generic candidate needs.  The result and argument keys use the
+;; shared `intern', so they denote the call's own variables.  A still-free
+;; literal argument is held to its class (see arg-admits?).
+(define xtc:solve:overload-viable
+  (lambda (c intern subst classes)
+    (let* ((rkey (cadr c)) (akeys (caddr c)) (cands (cadddr c))
+           ;; everything that depends only on (key, subst) is hoisted out of
+           ;; the candidate loop: the key decodes, their resolutions, and the
+           ;; class lookup (whose table of canonical representatives is itself
+           ;; resolved once here, not once per candidate argument --- the
+           ;; difference between a near-linear pass and the quadratic scan
+           ;; that made a big DSP constructor's solve run for seconds)
+           (rterm (xtc:type:from-intcode rkey intern))
+           (aterms (map (lambda (k) (xtc:type:from-intcode k intern)) akeys))
+           (class-reps (xtc:solve:class-reps classes intern subst))
+           ;; a key's admissibility datum: #f for a ground argument (no
+           ;; restriction), else (cons 'classed class-or-#f) for a still-free
+           ;; variable
+           (admit-datum (lambda (term)
+                          (let ((res (xtc:type:resolve term subst)))
+                            (if (xtc:type:var? res)
+                                (cons 'classed
+                                      (let loop ((cs class-reps))
+                                        (cond ((null? cs) #f)
+                                              ((equal? res (caar cs)) (cdar cs))
+                                              (else (loop (cdr cs))))))
+                                #f))))
+           (radmit (admit-datum rterm))
+           (aadmits (map admit-datum aterms))
+           (admits? (lambda (datum pcode)
+                      (or (not datum)
+                          (let ((class (cdr datum)))
+                            (or (not class)
+                                (cond ((number? pcode) (and (member pcode class) #t))
+                                      ((symbol? pcode)
+                                       (let ((s (symbol->string pcode)))
+                                         (and (> (string-length s) 0)
+                                              (char=? (string-ref s 0) #\!))))
+                                      (else #f)))))))
+           (r (cl:remove
+                #f
+                (map (lambda (cand)
+                       (cond
+                         ((eq? cand 'vecmath)
+                          (xtc:solve:vecmath-viable rkey akeys intern subst))
+                         ((eq? cand 'ptrcmp)
+                          (xtc:solve:ptrcmp-viable rkey akeys intern subst))
+                         ((<> (length (cdr cand)) (length akeys))
+                          #f)
+                         ;; the result key is held to its class exactly like an
+                         ;; argument: an index expression's (si64 si32) bound must
+                         ;; reject the floating candidates or the search would
+                         ;; happily commit them
+                         ((not (admits? radmit (car cand)))
+                          #f)
+                         (else
+                           (let* ((fresh (make-hashtable))
+                                  (s1 (xtc:type:unify rterm
+                                                      (xtc:type:from-intcode (car cand) fresh)
+                                                      subst)))
+                             (if (not s1)
+                                 #f
+                                 (let loop ((as aterms) (ads aadmits) (ps (cdr cand)) (s s1))
+                                   (if (null? as)
+                                       (cons cand s)
+                                       ;; the hoisted admissibility datum is computed
+                                       ;; under the entry substitution; a previous
+                                       ;; argument's unification in `s' cannot ground
+                                       ;; a classed literal to a non-numeric term, so
+                                       ;; the class bound still applies
+                                       (if (not (admits? (car ads) (car ps)))
+                                           #f
+                                           (let ((s2 (xtc:type:unify
+                                                       (car as)
+                                                       (xtc:type:from-intcode (car ps) fresh)
+                                                       s)))
+                                             (if s2 (loop (cdr as) (cdr ads) (cdr ps) s2) #f))))))))))
+                     cands))))
+      r)))
+
+;; One pass over the pending overloads: re-filter each against the current
+;; substitution, committing every overload that narrows to a single candidate
+;; as the pass goes, threading the substitution so one commit can disambiguate
+;; the next within the same round.  A still-ambiguous overload is kept with its
+;; NARROWED candidate list --- pruning is permanent, because a substitution
+;; only ever extends, so a candidate that fails once can never become viable
+;; again --- which is what keeps the whole resolve near-linear: the next round
+;; re-tests only the few survivors, not every original candidate.  (The
+;; narrowing is functional --- a fresh overload record --- so a backtracking
+;; branch in the search cannot leak its prunes into a sibling branch.)
+;; Returns (subst remaining progress?), or 'conflict if any overload has no
+;; viable candidate (no later binding can rescue an empty set).
+(define xtc:solve:commit-pass
+  (lambda (pending intern subst classes)
+    (let loop ((ps pending) (subst subst) (still '()) (progress #f))
+      (if (null? ps)
+          (list subst (reverse still) progress)
+          (let ((viable (xtc:solve:overload-viable (car ps) intern subst classes)))
+            (cond ((null? viable)
+                   (let ((c (car ps)))
+                     (xtc:solve:conflict!
+                       (lambda (ground)
+                         (xtc:solve:print-no-overload c intern (ground subst))))))
+                  ((null? (cdr viable))
+                   (loop (cdr ps) (cdr (car viable)) still #t))
+                  (else
+                    (loop (cdr ps) subst
+                          (cons (xtc:solve:c-overload
+                                  (cadr (car ps)) (caddr (car ps))
+                                  (map car viable))
+                                still)
+                          ;; narrowing alone is not progress: only a commit
+                          ;; extends the substitution
+                          progress))))))))
+
+;; Resolve every pending overload by backtracking search: cascade whichever
+;; overloads are uniquely viable, then split on the first still-ambiguous one,
+;; trying its candidates in order and recursing into the remainder; the first
+;; choice under which everything else resolves wins, and a conflict anywhere
+;; prunes that branch immediately.  This is the principled form of the old
+;; enumeration retry loop --- the same search over the same choices, but driven
+;; through the constraint graph rather than re-running the whole checker per
+;; guess, and needed for the same reason: a use chain can determine a variable
+;; only through the JOINT choice of several overloads ((cstring str) admitting
+;; String*/Symbol* against (String str) admitting String*/i8*; an untyped
+;; filter coefficient whose fp32-ness arrives two commits down a chain).
+;; Because each candidate list is ordered with its class default first
+;; (fp64/si64 head the numeric widths), the greedy first-success policy gives a
+;; genuinely tie-broken variable exactly the width the default rule would.
+;; Returns (subst . remaining-projects), or 'conflict.  Projections discharge
+;; INSIDE the cascade: a tref on a value some candidate choice grounds (a
+;; typeclass dictionary's field, a generic instance's slot) must contradict
+;; that choice within the search, where it prunes the branch --- not after it,
+;; where nothing can backtrack.
+(define xtc:solve:search
+  (lambda (pending projects intern subst classes)
+    (let cascade ((subst subst) (pending pending) (projects projects))
+      (let ((pr (xtc:solve:discharge-projects projects intern subst)))
+        (cond
+          ((eq? pr 'conflict) 'conflict)
+          ((caddr pr) (cascade (car pr) pending (cadr pr)))
+          (else
+            (let ((step (xtc:solve:commit-pass pending intern subst classes)))
+              (cond
+                ((eq? step 'conflict) 'conflict)
+                ((caddr step) (cascade (car step) (cadr step) projects))
+                ((null? (cadr step)) (cons (car step) projects))
+                (else
+                  ;; split on the MOST CONSTRAINED overload (fewest viable
+                  ;; candidates): nearly-forced choices first, so the branching
+                  ;; a large function's many independent chains would otherwise
+                  ;; multiply collapses --- without this, a 500-line instrument
+                  ;; constructor's search runs for minutes instead of millis.
+                  ;; The pendings carry commit-pass's narrowed candidate lists,
+                  ;; so these viability tests are over the few survivors only.
+                  (let* ((pending (cadr step))
+                         (subst (car step))
+                         (viables (map (lambda (p)
+                                         (xtc:solve:overload-viable p intern subst classes))
+                                       pending))
+                         (idx (let imin ((i 0) (vs viables) (bi 0) (bn 1000000))
+                                (if (null? vs)
+                                    bi
+                                    (let ((n (length (car vs))))
+                                      (if (< n bn)
+                                          (imin (+ i 1) (cdr vs) i n)
+                                          (imin (+ i 1) (cdr vs) bi bn))))))
+                         (viable (list-ref viables idx))
+                         (rest (let split ((i 0) (ps pending) (acc '()))
+                                 (cond ((null? ps) (reverse acc))
+                                       ((= i idx) (split (+ i 1) (cdr ps) acc))
+                                       (else (split (+ i 1) (cdr ps)
+                                                    (cons (car ps) acc)))))))
+                    (let try ((vs viable))
+                      (if (null? vs)
+                          'conflict
+                          (let ((r (xtc:solve:search rest projects intern
+                                                     (cdr (car vs)) classes)))
+                            (if (eq? r 'conflict)
+                                (try (cdr vs))
+                                r))))))))))))))
+
+;; One pass over the pending DEFERRED constraints --- projections and
+;; call-or-value reads --- discharging every one whose subject term has
+;; resolved far enough to decide it, unifying the decided type with the
+;; constraint's result; the rest stay pending for a later round.  A projection
+;; decides when its aggregate's field reads off ground; a callval decides as
+;; soon as its head is a non-variable: a zero-parameter closure contributes
+;; its return, a closure with parameters is an arity error (conflict, as the
+;; old checker's failed retry was), and anything else contributes itself ---
+;; the call-a-plain-value leniency.  Returns (subst still-pending progress?),
+;; or 'conflict if a decided type contradicts a prior use of the result.
+;; Threading the substitution across the pass lets one discharge feed the next
+;; within the round.
+;; A projection whose aggregate is a fully-resolved tuple but whose (literal)
+;; index is past the last field is a genuine out-of-bounds error, not a
+;; not-yet-resolved projection.  Detecting it here lets us report a clean
+;; compile error instead of leaving the type unresolved (which crashes
+;; downstream in the driver's semantic phase with an internal car-of-#f).
+(define xtc:solve:tuple-index-oob?
+  (lambda (aggterm idx)
+    (let ((t (if (xtc:type:ptr? aggterm) (xtc:type:ptr-to aggterm) aggterm)))
+      ;; a ground tuple-like aggregate (a bare tuple, or a named/generic type
+      ;; that expands to one) whose field projection comes back empty: the
+      ;; index is past the last field
+      (and (integer? idx)
+           (null? (xtc:type:free-vars t))
+           (or (xtc:type:tuple? t)
+               (xtc:type:named? t)
+               (xtc:type:napp? t))
+           (not (xtc:type:project-field-term aggterm idx))))))
+
+(define xtc:solve:discharge-projects
+  (lambda (pending intern subst)
+    (let loop ((ps pending) (subst subst) (still '()) (progress #f))
+      (if (null? ps)
+          (list subst (reverse still) progress)
+          (let* ((c (car ps))
+                 ;; unify the constraint's result with a decided type, or
+                 ;; conflict naming the use that contradicts it
+                 (decide
+                   (lambda (decided what)
+                     (let ((s2 (xtc:type:unify
+                                 (xtc:type:from-intcode (cadr c) intern)
+                                 decided subst)))
+                       (if s2
+                           (loop (cdr ps) s2 still #t)
+                           (xtc:solve:conflict!
+                             (lambda (ground)
+                               (print
+                                 (string-append
+                                   "Type Error: " what " is "
+                                   (xtc:type:to-pretty decided intern)
+                                   ", but its use requires "
+                                   (xtc:solve:pretty-key (cadr c) intern (ground subst))
+                                   "\n")))))))))
+            (cond
+              ((xtc:solve:callval? c)
+               (let ((head (xtc:type:apply-subst
+                             (xtc:type:from-intcode (caddr c) intern) subst)))
+                 (if (xtc:type:var? head)
+                     (loop (cdr ps) subst (cons c still) progress)
+                     (let* ((base (cdr (xtc:type:strip-ptr head)))
+                            (decided
+                              (cond ((not (xtc:type:closure? base)) head)
+                                    ((null? (cddr base)) (cadr base))
+                                    (else #f))))
+                       (if (not decided)
+                           (xtc:solve:conflict!
+                             (lambda (ground)
+                               (print
+                                 (string-append
+                                   "Type Error: a closure of type "
+                                   (xtc:solve:pretty-key (caddr c) intern (ground subst))
+                                   " is called with no arguments\n"))))
+                           (decide decided
+                                   (string-append "the call of "
+                                                  (xtc:type:to-pretty head intern))))))))
+              ((xtc:solve:exercise? c)
+               (let ((argterms (map (lambda (k)
+                                      (xtc:type:apply-subst
+                                        (xtc:type:from-intcode k intern) subst))
+                                    (list-ref c 4))))
+                 (if (cl:find-if (lambda (t) (pair? (xtc:type:free-vars t))) argterms)
+                     (loop (cdr ps) subst (cons c still) progress)
+                     (let ((ic (and *xtc:solve:exercise-hook*
+                                    (*xtc:solve:exercise-hook* (caddr c) (cadddr c) argterms))))
+                       (if (not ic)
+                           ;; nothing to learn: the return stays open, and the
+                           ;; read-back names the site it drops
+                           (loop (cdr ps) subst still #t)
+                           (decide (xtc:type:from-intcode ic (make-hashtable))
+                                   (string-append
+                                     "the return of ("
+                                     (car (string-split-on (symbol->string (caddr c)) "##"))
+                                     " " (xtc:type:to-pretty-list argterms intern)
+                                     ")")))))))
+              (else
+                (let* ((aggterm (xtc:type:apply-subst
+                                  (xtc:type:from-intcode (caddr c) intern) subst))
+                       (field (xtc:type:project-field-term aggterm (cadddr c))))
+                  (cond
+                    ((and field (null? (xtc:type:free-vars field)))
+                     (decide field
+                             (string-append "field " (number->string (cadddr c))
+                                            " of " (xtc:type:to-pretty aggterm intern))))
+                    ((xtc:solve:tuple-index-oob? aggterm (cadddr c))
+                     (xtc:diagnostics:print-index-oob-error 'tuple (cadddr c)))
+                    (else
+                      (loop (cdr ps) subst (cons c still) progress)))))))))))
+
+;; Default only the literals the pending DEFERRED constraints wait on --- the
+;; free variables of their subject terms (a projection's aggregate, a
+;; call-or-value's head, an exercise's arguments) --- returning the extended
+;; substitution, or the same one when no such literal is free.  Run when the
+;; resolve stalls with overloads still pending, BEFORE the search: a deferred
+;; constraint waiting on nothing but a literal's width decides nothing the
+;; search could decide differently (a pending overload on that literal would
+;; have committed or be the one searched), whereas the search, splitting on an
+;; overload whose key is the deferred constraint's still-free RESULT, picks a
+;; candidate blind and can only contradict it once it has returned ---
+;; (println (eval e)) over (Lit 1) chose Add's printer for the return the
+;; exercise then pinned to i64.
+(define xtc:solve:apply-defaults-for-deferred
+  (lambda (constraints intern subst projects)
+    (let ((wanted
+            (apply append
+                   (map (lambda (c)
+                          (apply append
+                                 (map (lambda (k)
+                                        (xtc:type:free-vars
+                                          (xtc:type:apply-subst
+                                            (xtc:type:from-intcode k intern) subst)))
+                                      (if (xtc:solve:exercise? c)
+                                          (list-ref c 4)
+                                          (list (caddr c))))))
+                        projects))))
+      (if (null? wanted)
+          subst
+          (let loop ((cs constraints) (subst subst))
+            (cond ((null? cs) subst)
+                  ((xtc:solve:default? (car cs))
+                   (let* ((c (car cs))
+                          (resolved (xtc:type:resolve
+                                      (xtc:type:from-intcode (cadr c) intern) subst)))
+                     (if (and (xtc:type:var? resolved)
+                              (memv (xtc:type:var-id resolved) wanted))
+                         (let ((subst2 (xtc:type:unify
+                                         resolved
+                                         (xtc:type:from-intcode (apply min (caddr c)) intern)
+                                         subst)))
+                           (loop (cdr cs) (if subst2 subst2 subst)))
+                         (loop (cdr cs) subst))))
+                  (else (loop (cdr cs) subst))))))))
+
+;; Discharge projections, overloads and defaults to a fixpoint.  Each round first
+;; discharges every projection whose aggregate has resolved (which can concretise
+;; a key and so enable an overload); then commits every overload that has become
+;; unambiguous, narrowing the substitution; when neither makes progress it applies
+;; one pass of numeric defaulting, which can pin a free literal argument and so
+;; disambiguate an overload or feed a projection on the next round.  This
+;; interleaving is what lets a downstream signature beat the default (an
+;; unambiguous overload commits first, forcing its argument) while a default
+;; still breaks a tie no signature can --- subsuming the old backtracking
+;; enumeration with no search.  A projection still pending at the fixpoint (its
+;; aggregate never resolved) simply leaves its result undetermined.
+(define xtc:solve:resolve
+  (lambda (constraints intern subst)
+    (let ((pending0 (cl:remove-if-not xtc:solve:overload? constraints))
+          (projects0 (cl:remove-if-not xtc:solve:deferred? constraints))
+          (classes (xtc:solve:class-map constraints)))
+      (let loop ((subst subst) (pending pending0) (projects projects0))
+        (let ((pr (xtc:solve:discharge-projects projects intern subst)))
+          (cond
+            ((eq? pr 'conflict) 'conflict)
+            ((caddr pr) (loop (car pr) pending (cadr pr)))
+            (else
+              (let ((step (xtc:solve:commit-pass pending intern subst classes)))
+                (cond
+                  ((eq? step 'conflict) 'conflict)
+                  ((caddr step) (loop (car step) (cadr step) projects))
+                  ((pair? (cadr step))
+                   ;; a stall with overloads still pending: first default the
+                   ;; literals a deferred constraint is waiting on (it may
+                   ;; then decide, and pin the key an overload is stuck on);
+                   ;; otherwise resolve the overloads by search --- choices
+                   ;; propagate through each other, so a default cannot pin a
+                   ;; literal at a width its uses contradict
+                   (let ((subst2 (xtc:solve:apply-defaults-for-deferred
+                                   constraints intern (car step) projects)))
+                     (if (> (length subst2) (length (car step)))
+                         (loop subst2 (cadr step) projects)
+                         (let ((r (xtc:solve:search (cadr step) projects intern
+                                                    (car step) classes)))
+                           (if (eq? r 'conflict)
+                               ;; every candidate combination failed: say so,
+                               ;; then the last branch's own reason
+                               (let ((why *xtc:solve:conflict-why*))
+                                 (xtc:solve:conflict!
+                                   (lambda (ground)
+                                     (print "Type Error: no choice of overload candidates satisfies every use; the last attempt failed because\n")
+                                     (if why (why ground)))))
+                               (loop (car r) '() (cdr r)))))))
+                  (else
+                    ;; overloads done: numeric defaulting for whatever literals
+                    ;; no use ever pinned (it can wake a pending projection)
+                    (let ((subst2 (xtc:solve:apply-defaults constraints intern subst)))
+                      (if (> (length subst2) (length subst))
+                          (loop subst2 pending projects)
+                          subst2))))))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; reading back        ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The resolved int-code type of a variable, or #f if the solve failed or the
+;; variable is still free (its type was never determined).  Pass the same
+;; `intern' table used for the solve.
+(define xtc:solve:type-of
+  (lambda (sym subst intern)
+    (if (eq? subst 'conflict)
+        #f
+        (let ((term (xtc:type:apply-subst
+                      (xtc:type:from-intcode sym intern) subst)))
+          (if (pair? (xtc:type:free-vars term))
+              #f
+              (xtc:type:to-intcode-open term intern))))))
+
+;; Like type-of but a residual variable renders as its bang-symbol instead of
+;; refusing: the read-back for a variable whose FORCED annotation was itself a
+;; bang pattern (a data-constructor argument annotated with a recursive
+;; type's bare expansion) --- the old checker kept such pattern-typed entries.
+(define xtc:solve:type-of-open
+  (lambda (sym subst intern)
+    (if (eq? subst 'conflict)
+        #f
+        (xtc:type:to-intcode-open
+          (xtc:type:apply-subst (xtc:type:from-intcode sym intern) subst)
+          intern))))
+

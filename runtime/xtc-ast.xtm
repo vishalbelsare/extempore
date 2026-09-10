@@ -1,0 +1,331 @@
+;;
+;; Thin AST accessor layer for the xtlang compiler.
+;;
+;; Provides predicates, accessors, and constructors for the 7 core
+;; node types (let, lambda, if, begin, set!, call, var, lit) as they
+;; leave first-transform, and for the nodes the later phases introduce:
+;; ret-> (mark-returns), __make-closure*/__make-env* (closure
+;; conversion, then re-shaped with types by add-types-to-source) and
+;; clrun-> (closure application).  The underlying representation is
+;; unchanged (tagged lists); the layer exists so every pass reads a
+;; node's fields by name rather than by position.
+;;
+;; Loaded between xtc-transforms.xtm and xtc-typecheck.xtm.
+;;
+
+;; --- predicates ---
+
+(define ast:let?
+  (lambda (ast)
+    (and (pair? ast) (member (car ast) *xtc:globals:letslist*))))
+
+(define ast:lambda?
+  (lambda (ast)
+    (and (pair? ast) (member (car ast) *xtc:globals:lambdaslist*))))
+
+(define ast:if?
+  (lambda (ast)
+    (and (pair? ast) (member (car ast) '(if ifret)))))
+
+(define ast:begin?
+  (lambda (ast)
+    (and (pair? ast) (eq? (car ast) 'begin))))
+
+(define ast:set!?
+  (lambda (ast)
+    (and (pair? ast) (eq? (car ast) 'set!))))
+
+(define ast:var?
+  (lambda (ast)
+    (symbol? ast)))
+
+(define ast:lit?
+  (lambda (ast)
+    (or (number? ast) (string? ast) (boolean? ast))))
+
+(define ast:call?
+  (lambda (ast)
+    (and (list? ast)
+         (not (null? ast))
+         (not (ast:let? ast))
+         (not (ast:lambda? ast))
+         (not (ast:if? ast))
+         (not (ast:begin? ast))
+         (not (ast:set!? ast)))))
+
+;; --- let accessors ---
+;; (let ((x 1) (y 2)) body) => (let bindings body)
+
+(define ast:let-tag
+  (lambda (ast) (car ast)))
+
+(define ast:let-bindings
+  (lambda (ast) (cadr ast)))
+
+(define ast:let-body
+  (lambda (ast) (caddr ast)))
+
+;; --- lambda accessors ---
+;; (lambda (x y) body) => (lambda params body)
+
+(define ast:lambda-tag
+  (lambda (ast) (car ast)))
+
+(define ast:lambda-params
+  (lambda (ast) (cadr ast)))
+
+(define ast:lambda-body
+  (lambda (ast) (caddr ast)))
+
+;; --- source-shape body accessors ---
+;; before first-transform a let or lambda carries any number of body forms,
+;; (let bindings form ...); first-transform wraps them in one begin, after
+;; which ast:let-body / ast:lambda-body is the whole body
+
+(define ast:let-body-forms
+  (lambda (ast) (cddr ast)))
+
+(define ast:lambda-body-forms
+  (lambda (ast) (cddr ast)))
+
+;; --- if accessors ---
+;; (if test then else) => (if test then else)
+
+(define ast:if-test
+  (lambda (ast) (cadr ast)))
+
+(define ast:if-then
+  (lambda (ast) (caddr ast)))
+
+(define ast:if-else
+  (lambda (ast)
+    (if (null? (cdddr ast)) '() (cadddr ast))))
+
+;; a desugared cond drops a missing else branch entirely, so an if node
+;; is 3 or 4 long; ast:if-else cannot tell "no else" from "else is ()"
+(define ast:if-has-else?
+  (lambda (ast) (not (null? (cdddr ast)))))
+
+;; --- begin accessors ---
+;; (begin e1 e2 ...) => (begin . exprs)
+
+(define ast:begin-exprs
+  (lambda (ast) (cdr ast)))
+
+;; --- set! accessors ---
+;; (set! var expr)
+
+(define ast:set!-var
+  (lambda (ast) (cadr ast)))
+
+(define ast:set!-expr
+  (lambda (ast) (caddr ast)))
+
+;; --- binding accessors ---
+;; a let (or __make-env) binding: (var expr); after add-types-to-source an
+;; env binding's var slot holds the (var . type) entry instead
+
+(define ast:binding-var
+  (lambda (b) (car b)))
+
+(define ast:binding-expr
+  (lambda (b) (cadr b)))
+
+;; --- call accessors ---
+;; (f a b ...) => head and args
+
+(define ast:call-head
+  (lambda (ast) (car ast)))
+
+(define ast:call-args
+  (lambda (ast) (cdr ast)))
+
+(define ast:call-arg
+  (lambda (ast n) (list-ref (cdr ast) n)))
+
+;; --- ret-> accessors ---
+;; (ret-> name expr): the return marker mark-returns inserts
+
+(define ast:ret?
+  (lambda (ast)
+    (and (pair? ast) (eq? (car ast) 'ret->))))
+
+(define ast:ret-name
+  (lambda (ast) (cadr ast)))
+
+(define ast:ret-expr
+  (lambda (ast) (caddr ast)))
+
+;; --- closure accessors ---
+;; closure conversion turns a lambda into
+;;   (__make-closure-z alloc env params body)
+;; and add-types-to-source re-shapes that into
+;;   (__make-closure-z alloc name rettype envtypes argtypes body)
+;; where envtypes and argtypes are (var . type) entries
+
+(define *xtc:ast:closure-tags* '(__make-closure __make-closure-s __make-closure-h __make-closure-z))
+
+(define ast:closure?
+  (lambda (ast)
+    (and (pair? ast) (member (car ast) *xtc:ast:closure-tags*))))
+
+(define ast:closure-tag
+  (lambda (ast) (car ast)))
+
+(define ast:closure-alloc
+  (lambda (ast) (cadr ast)))
+
+(define ast:closure-env
+  (lambda (ast) (caddr ast)))
+
+(define ast:closure-params
+  (lambda (ast) (cadddr ast)))
+
+(define ast:closure-body
+  (lambda (ast) (list-ref ast 4)))
+
+(define ast:typed-closure-name
+  (lambda (ast) (list-ref ast 2)))
+
+(define ast:typed-closure-rettype
+  (lambda (ast) (list-ref ast 3)))
+
+(define ast:typed-closure-envtypes
+  (lambda (ast) (list-ref ast 4)))
+
+(define ast:typed-closure-argtypes
+  (lambda (ast) (list-ref ast 5)))
+
+(define ast:typed-closure-body
+  (lambda (ast) (list-ref ast 6)))
+
+;; --- env accessors ---
+;; closure conversion turns a let into (__make-env alloc bindings body)
+
+(define *xtc:ast:env-tags* '(__make-env __make-env-zone))
+
+(define ast:env?
+  (lambda (ast)
+    (and (pair? ast) (member (car ast) *xtc:ast:env-tags*))))
+
+(define ast:env-tag
+  (lambda (ast) (car ast)))
+
+(define ast:env-alloc
+  (lambda (ast) (cadr ast)))
+
+(define ast:env-bindings
+  (lambda (ast) (caddr ast)))
+
+(define ast:env-body
+  (lambda (ast) (cadddr ast)))
+
+;; --- clrun-> accessors ---
+;; (clrun-> callee arg ...): apply a closure
+
+(define ast:clrun?
+  (lambda (ast)
+    (and (pair? ast) (eq? (car ast) 'clrun->))))
+
+(define ast:clrun-callee
+  (lambda (ast) (cadr ast)))
+
+(define ast:clrun-args
+  (lambda (ast) (cddr ast)))
+
+;; --- constructors ---
+
+(define ast:make-if
+  (lambda (test then else-branch)
+    (list 'if test then else-branch)))
+
+(define ast:make-begin
+  (lambda (exprs)
+    (cons 'begin exprs)))
+
+(define ast:make-set!
+  (lambda (var expr)
+    (list 'set! var expr)))
+
+(define ast:make-let
+  (lambda (tag bindings body)
+    (cons tag (cons bindings (list body)))))
+
+(define ast:make-lambda
+  (lambda (tag params body)
+    (cons tag (cons params (list body)))))
+
+;; an if or ifret node; a missing else is omitted, not nulled
+(define ast:make-tagged-if
+  (lambda (tag test then . else)
+    (cons tag (cons test (cons then else)))))
+
+(define ast:make-binding
+  (lambda (var expr)
+    (list var expr)))
+
+(define ast:make-ret
+  (lambda (name expr)
+    (list 'ret-> name expr)))
+
+(define ast:make-closure
+  (lambda (tag alloc env params body)
+    (list tag alloc env params body)))
+
+(define ast:make-typed-closure
+  (lambda (tag alloc name rettype envtypes argtypes body)
+    (list tag alloc name rettype envtypes argtypes body)))
+
+(define ast:make-env
+  (lambda (tag alloc bindings body)
+    (list tag alloc bindings body)))
+
+(define ast:make-clrun
+  (lambda (callee args)
+    (cons 'clrun-> (cons callee args))))
+
+;; --- validation ---
+;; run by the driver on every function after first-transform; a full walk
+;; of the AST, but not a measurable share of a compile (AOT compiles of
+;; audio_dsp.xtm and instruments.xtm are unchanged to within noise)
+
+(define *xtc:ast:validate* #t)
+
+(define ast:validate
+  (lambda (ast)
+    (cond
+      ((null? ast) #t)
+      ((ast:lit? ast) #t)
+      ((ast:var? ast) #t)
+      ((ast:let? ast)
+       (if (< (length ast) 3)
+           (begin (log-error 'ast:validate "let node too short:" ast) #f)
+           (begin
+             (for-each (lambda (b)
+                         (if (or (not (list? b)) (< (length b) 2))
+                             (log-error 'ast:validate "bad let binding:" b)))
+                       (ast:let-bindings ast))
+             (ast:validate (ast:let-body ast)))))
+      ((ast:lambda? ast)
+       (if (< (length ast) 3)
+           (begin (log-error 'ast:validate "lambda node too short:" ast) #f)
+           (ast:validate (ast:lambda-body ast))))
+      ((ast:if? ast)
+       (if (< (length ast) 3)
+           (begin (log-error 'ast:validate "if node too short:" ast) #f)
+           (begin
+             (ast:validate (ast:if-test ast))
+             (ast:validate (ast:if-then ast))
+             (if (> (length ast) 3) (ast:validate (ast:if-else ast)))
+             #t)))
+      ((ast:begin? ast)
+       (for-each ast:validate (ast:begin-exprs ast))
+       #t)
+      ((ast:set!? ast)
+       (if (< (length ast) 3)
+           (begin (log-error 'ast:validate "set! node too short:" ast) #f)
+           (ast:validate (ast:set!-expr ast))))
+      ((list? ast)
+       (for-each ast:validate ast)
+       #t)
+      (else #t))))

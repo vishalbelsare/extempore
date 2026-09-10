@@ -1,0 +1,112 @@
+name: Sanitizers
+
+# Sanitizer and clang-tidy runs are slow and memory-hungry, so they run on a
+# weekly schedule and on demand rather than on every push. They are
+# intentionally NOT required checks: treat a red run as a list of things to
+# triage, not a merge blocker. Once a configuration has proven reliably green it
+# can be promoted into the main build-and-test matrix (.github/workflows/
+# build-and-test.yml).
+#
+# Everything runs on Linux x86_64 and reuses the LLVM cache built by the main
+# build job (the EXTEMPORE_SANITIZE flag only instruments Extempore's own
+# objects, not the cached LLVM libraries), so these jobs never save that cache.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays, 06:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanitize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - preset: sanitize-tsan
+            name: ThreadSanitizer
+          - preset: sanitize-asan-ubsan
+            name: Address+UB Sanitizer
+    name: ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-build
+        with:
+          preset: ${{ matrix.preset }}
+          cache-key-os: ubuntu-24.04
+          save-llvm-cache: "false"
+
+      - name: Build
+        # setarch -R disables ASLR for the AOT-compile step: ThreadSanitizer
+        # aborts with "unexpected memory mapping" when a PIE binary lands outside
+        # its expected address ranges, which it reliably does on the runners.
+        # The personality flag is inherited by the extempore processes ninja
+        # spawns. A sanitizer report raised while AOT-compiling the standard
+        # library shouldn't fail the build; the test step below is where findings
+        # should surface. detect_leaks=0 because Extempore deliberately leaks a
+        # handful of process-lifetime objects (the primary SchemeProcess/REPL,
+        # and OSC servers whose receive thread never stops), which LeakSanitizer
+        # would otherwise flag. Concurrent AOT compiles are capped by the `aot`
+        # job pool in CMakeLists.txt.
+        env:
+          TSAN_OPTIONS: "exitcode=0"
+          # detect_container_overflow=0: Extempore's instrumented std::vector/
+          # std::string buffers cross into the uninstrumented cached LLVM libs,
+          # which ASan can't see, producing false-positive container-overflow
+          # reports. Disable that one check; all other ASan checks stay on.
+          ASAN_OPTIONS: "exitcode=0:detect_leaks=0:detect_container_overflow=0"
+          UBSAN_OPTIONS: "exitcode=0"
+        run: setarch -R cmake --build build
+
+      - name: Test
+        timeout-minutes: 90
+        # Restricted to the fast, deterministic suites. The example/audio tests
+        # carry tight per-test timeouts that instrumentation's 5-15x slowdown
+        # would trip, drowning real findings in spurious timeouts. compiler-unit
+        # is left out for the same reason plus budget: its AOT round-trip test
+        # drives its own un-scaled sub-process timeouts, and libs-core alone
+        # already fills a good part of this step at 15x. Promote it once a run
+        # shows headroom.
+        env:
+          TSAN_OPTIONS: "halt_on_error=0 second_deadlock_stack=1"
+          ASAN_OPTIONS: "halt_on_error=0:detect_leaks=0:abort_on_error=1:detect_container_overflow=0"
+          UBSAN_OPTIONS: "halt_on_error=0:print_stacktrace=1"
+        run: setarch -R ctest --test-dir build --build-config Release --label-regex "libs-core|cpp-unit" --output-on-failure
+
+  clang-tidy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # Informational until the tree is confirmed clean against .clang-tidy; the
+    # check set there is curated but has never been enforced in CI. Promote to a
+    # required check (and set WarningsAsErrors) once it reports clean.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-build
+        with:
+          preset: ci
+          cache-key-os: ubuntu-24.04
+          save-llvm-cache: "false"
+
+      - name: Install clang-tidy
+        run: sudo apt-get install -y clang-tidy
+
+      - name: Generate sources and headers
+        # clang-tidy needs the generated headers (e.g. ExtemporeVersion.h) and a
+        # populated compile_commands.json to parse the translation units.
+        run: cmake --build build --target extempore
+
+      - name: Run clang-tidy
+        run: cmake --build build --target tidy

@@ -33,63 +33,56 @@
  *
  */
 
+#pragma once
+
 #include "UNIV.h"
-#include "EXTMutex.h"
+
+#include "ext/NetCompat.h"
+#include <mutex>
 #include <string>
 #include <unordered_map>
-
-#ifdef _WIN32
-#include <experimental/buffer>
-#include <experimental/executor>
-#include <experimental/internet>
-#include <experimental/io_context>
-#include <experimental/net>
-#include <experimental/netfwd>
-#include <experimental/socket>
-#include <experimental/timer>
-#endif
 
 namespace extemp {
 
 class SchemeProcess;
 
 class SchemeREPL {
-private:
+  private:
     typedef std::unordered_map<std::string, SchemeREPL*> repls_type;
 
     static const int BUFLENGTH = 1024;
-private:
-    std::string                   m_title;
-    SchemeProcess*                m_process;
-#ifdef _WIN32
-    std::experimental::net::ip::tcp::socket* m_serverSocket;
-    std::experimental::net::io_context*      m_serverIoService;
-#else
-    int                           m_serverSocket;
-#endif
-    char                          m_buf[BUFLENGTH];
-    bool                          m_connected;
-    bool                          m_active;
-    EXTMutex                      m_writeLock;
 
+  private:
+    std::string m_title;
+    SchemeProcess* m_process;
+    SOCKET m_serverSocket;
+    char m_buf[BUFLENGTH];
+    bool m_connected;
+    bool m_active;
+    std::recursive_mutex m_writeLock;
+
+    // Registry of live REPLs by title; guarded by sm_replsMutex because REPLs
+    // are created and looked up from different Scheme process threads.
     static repls_type sm_repls;
-public:
-    SchemeREPL(const std::string& Title, SchemeProcess* Process);
+    static std::mutex sm_replsMutex;
 
-    const std::string& getTitle() { return m_title; }
-    void writeString(std::string&&); // ick (modifying)
+  public:
+    SchemeREPL(const std::string& Title, SchemeProcess* Process);
+    ~SchemeREPL();  // closes the socket and deregisters the title
+    SchemeREPL(const SchemeREPL&) = delete;
+    SchemeREPL& operator=(const SchemeREPL&) = delete;
+
+    const std::string& getTitle() {
+        return m_title;
+    }
+    void writeString(std::string&&);  // ick (modifying)
     bool connectToProcessAtHostname(const std::string&, int);
     void closeREPL();
-    SchemeProcess* getProcess() { return m_process; }
-
-    static SchemeREPL* I(const std::string& name)
-    {
-        auto iter(sm_repls.find(name));
-        if (unlikely(iter == sm_repls.end())) {
-            return nullptr;
-        }
-        return iter->second;
+    SchemeProcess* getProcess() {
+        return m_process;
     }
+
+    static SchemeREPL* I(const std::string& name);
 };
 
-}
+}  // namespace extemp

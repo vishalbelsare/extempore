@@ -1,0 +1,273 @@
+;;; audiotest.xtm -- assertion helpers for offline-rendered audio files
+
+;; Author: Ben Swift
+;; Keywords: extempore, testing
+
+;;; Commentary:
+
+;; Companion to --audio-outfile. After rendering a DSP to a float32 WAV, load
+;; this file in a second --batch process to sanity-check the output:
+;;
+;;   extempore --batch '(sys:load "libs/core/audiotest.xtm")
+;;                      (audiotest_assert_sine "/tmp/x.wav" 440.0)'
+;;
+;; Each assertion prints a one-line PASS/FAIL and calls (quit <status>) so
+;; that CTest sees a clean exit code. The helpers are intentionally coarse:
+;; they verify "a sine of roughly the expected frequency is present", not
+;; sample-accurate reproduction. This matches the offline driver's free-run
+;; semantics (see --audio-outfile docs).
+
+;;; Code:
+
+(sys:load "libs/core/audiobuffer.xtm")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; numerical helpers on AudioBuffer ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; peak absolute sample value on channel ch (or all-channels if ch < 0)
+(bind-func audiotest_peak
+  (lambda (ab:AudioBuffer* ch:i64)
+    (let ((nframes (AudioBuffer_frames ab))
+          (nchan (AudioBuffer_channels ab))
+          (data (AudioBuffer_data ab))
+          (peak:SAMPLE 0.0)
+          (lo:i64 0)
+          (hi:i64 0)
+          (i 0)
+          (k 0))
+      (if (< ch 0)
+          (begin (set! lo 0) (set! hi nchan))
+          (begin (set! lo ch) (set! hi (+ ch 1))))
+      (dotimes (i nframes)
+        (dotimes (k (- hi lo))
+          (let ((v (fabs (pref data (+ (* i nchan) (+ lo k))))))
+            (if (> v peak) (begin (set! peak v) void) void))))
+      peak)))
+
+;; RMS of channel ch (or all-channels if ch < 0)
+(bind-func audiotest_rms
+  (lambda (ab:AudioBuffer* ch:i64)
+    (let ((nframes (AudioBuffer_frames ab))
+          (nchan (AudioBuffer_channels ab))
+          (data (AudioBuffer_data ab))
+          (acc:double 0.0)
+          (n:i64 0)
+          (lo:i64 0)
+          (hi:i64 0)
+          (i 0)
+          (k 0))
+      (if (< ch 0)
+          (begin (set! lo 0) (set! hi nchan))
+          (begin (set! lo ch) (set! hi (+ ch 1))))
+      (dotimes (i nframes)
+        (dotimes (k (- hi lo))
+          (let ((v (convert (pref data (+ (* i nchan) (+ lo k))) double)))
+            (set! acc (+ acc (* v v)))
+            (set! n (+ n 1)))))
+      (if (= n 0) 0.0 (sqrt (/ acc (convert n double)))))))
+
+;; Goertzel energy at freq on channel ch (ch < 0 => mix-down to mono first)
+(bind-func audiotest_goertzel
+  (lambda (ab:AudioBuffer* ch:i64 freq:double)
+    (let ((nframes (AudioBuffer_frames ab))
+          (nchan (AudioBuffer_channels ab))
+          (data (AudioBuffer_data ab))
+          (sr (AudioBuffer_samplerate ab))
+          (N (convert nframes double))
+          (k (convert (dtoi64 (+ 0.5 (/ (* N freq) sr))) double))
+          (w (* 2.0 (* 3.14159265358979323846 (/ k N))))
+          (coeff (* 2.0 (cos w)))
+          (s0:double 0.0)
+          (s1:double 0.0)
+          (s2:double 0.0)
+          (i 0))
+      (dotimes (i nframes)
+        (let ((x:double 0.0)
+              (sum:double 0.0)
+              (j:i64 0))
+          (if (< ch 0)
+              (begin
+                (dotimes (j nchan)
+                  (set! sum (+ sum (convert (pref data (+ (* i nchan) j)) double))))
+                (set! x (/ sum (convert nchan double))))
+              (set! x (convert (pref data (+ (* i nchan) ch)) double)))
+          (set! s0 (+ x (- (* coeff s1) s2)))
+          (set! s2 s1)
+          (set! s1 s0)))
+      (+ (* s2 s2) (- (* s1 s1) (* coeff (* s1 s2)))))))
+
+;;;;;;;;;;;;;;;;;;;;;;
+;; top-level assert ;;
+;;;;;;;;;;;;;;;;;;;;;;
+
+;; audiotest_assert_sine: load a WAV, verify it contains a sine of roughly freq Hz.
+;; Checks:
+;;   1. file loads and has at least 0.1 s of audio
+;;   2. peak ∈ (0.05, 0.99)      -- non-silent, non-clipping
+;;   3. RMS > 0.05                -- non-trivial energy
+;;   4. Goertzel(freq) > 100 * Goertzel(freq/2) AND > 100 * Goertzel(freq*2)
+;;
+;; Returns 0 (pass) or 1 (fail) and calls (quit ...).
+(bind-func audiotest_assert_sine
+  (lambda (path:i8* freq:double)
+    (let ((ab (AudioBuffer_from_wave path)))
+      (if (null? ab)
+          (begin (printf "FAIL: could not read %s\n" path) 1)
+          (let ((sr (AudioBuffer_samplerate ab))
+                (nfr (AudioBuffer_frames ab))
+                (pk (convert (audiotest_peak ab -1) double))
+                (rms (audiotest_rms ab -1))
+                (g0 (audiotest_goertzel ab -1 (/ freq 2.0)))
+                (g1 (audiotest_goertzel ab -1 freq))
+                (g2 (audiotest_goertzel ab -1 (* freq 2.0)))
+                (ok #t))
+            (printf "audiotest: %s  sr=%.0f frames=%lld peak=%.4f rms=%.4f  g(%.0f/2)=%.2e g(%.0f)=%.2e g(%.0f*2)=%.2e\n"
+                    path sr nfr pk rms freq g0 freq g1 freq g2)
+            (if (< nfr (dtoi64 (* sr 0.1))) (begin (println "FAIL: too short") (set! ok #f)))
+            (if (< pk 0.05) (begin (println "FAIL: peak < 0.05 (silence?)") (set! ok #f)))
+            (if (> pk 0.99) (begin (println "FAIL: peak > 0.99 (clipping?)") (set! ok #f)))
+            (if (< rms 0.05) (begin (println "FAIL: rms < 0.05") (set! ok #f)))
+            (if (or (< g1 (* 100.0 g0)) (< g1 (* 100.0 g2)))
+                (begin (printf "FAIL: target freq %.1f Hz not dominant\n" freq) (set! ok #f)))
+            (if ok (begin (println "PASS") 0) 1))))))
+
+;; Per-channel sine check. Verifies the WAV has exactly two channels and each
+;; channel contains a dominant sine at the expected frequency. Useful for
+;; catching L/R swaps or single-channel-only DSPs.
+(bind-func audiotest_assert_stereo_sine
+  (lambda (path:i8* freq_l:double freq_r:double)
+    (let ((ab (AudioBuffer_from_wave path)))
+      (if (null? ab)
+          (begin (printf "FAIL: could not read %s\n" path) 1)
+          (let ((nch (AudioBuffer_channels ab))
+                (ok #t))
+            (if (<> nch 2)
+                (begin (printf "FAIL: expected 2 channels, got %lld\n" nch) (set! ok #f))
+                (let ((pk_l (convert (audiotest_peak ab 0) double))
+                      (pk_r (convert (audiotest_peak ab 1) double))
+                      (gl_at_l (audiotest_goertzel ab 0 freq_l))
+                      (gl_at_r (audiotest_goertzel ab 0 freq_r))
+                      (gr_at_l (audiotest_goertzel ab 1 freq_l))
+                      (gr_at_r (audiotest_goertzel ab 1 freq_r)))
+                  (printf "audiotest-stereo: %s  pk_l=%.4f pk_r=%.4f  L[g@%.0f=%.2e g@%.0f=%.2e]  R[g@%.0f=%.2e g@%.0f=%.2e]\n"
+                          path pk_l pk_r freq_l gl_at_l freq_r gl_at_r freq_l gr_at_l freq_r gr_at_r)
+                  (if (< pk_l 0.05) (begin (println "FAIL: left channel silent") (set! ok #f)))
+                  (if (< pk_r 0.05) (begin (println "FAIL: right channel silent") (set! ok #f)))
+                  ;; left should have freq_l dominant over freq_r
+                  (if (< gl_at_l (* 10.0 gl_at_r))
+                      (begin (printf "FAIL: left channel should contain %.1f Hz, not %.1f Hz\n" freq_l freq_r) (set! ok #f)))
+                  ;; right should have freq_r dominant over freq_l
+                  (if (< gr_at_r (* 10.0 gr_at_l))
+                      (begin (printf "FAIL: right channel should contain %.1f Hz, not %.1f Hz\n" freq_r freq_l) (set! ok #f)))))
+            (if ok (begin (println "PASS") 0) 1))))))
+
+;; Verify three specific frequencies are simultaneously present in the signal.
+;; Useful for multi-oscillator or multi-threaded DSPs where each voice plays a
+;; different pitch. For each fN, asserts Goertzel(fN) is >= min_energy and is
+;; dominant over neighbor bins that aren't one of the three target pitches.
+(bind-func audiotest_assert_three_sines
+  (lambda (path:i8* f1:double f2:double f3:double)
+    (let ((ab (AudioBuffer_from_wave path)))
+      (if (null? ab)
+          (begin (printf "FAIL: could not read %s\n" path) 1)
+          (let ((pk (convert (audiotest_peak ab -1) double))
+                (g1 (audiotest_goertzel ab -1 f1))
+                (g2 (audiotest_goertzel ab -1 f2))
+                (g3 (audiotest_goertzel ab -1 f3))
+                ;; probes at frequencies we expect to NOT contain energy
+                (gmid12 (audiotest_goertzel ab -1 (* 0.5 (+ f1 f2))))
+                (gmid23 (audiotest_goertzel ab -1 (* 0.5 (+ f2 f3))))
+                (min_target 0.0)
+                (max_noise 0.0)
+                (ok #t))
+            (printf "audiotest-three: %s  peak=%.4f  g@%.0f=%.2e g@%.0f=%.2e g@%.0f=%.2e  noise[%.0f=%.2e %.0f=%.2e]\n"
+                    path pk f1 g1 f2 g2 f3 g3
+                    (* 0.5 (+ f1 f2)) gmid12
+                    (* 0.5 (+ f2 f3)) gmid23)
+            (set! min_target (if (< g1 g2) g1 g2))
+            (if (< g3 min_target) (set! min_target g3))
+            (set! max_noise (if (> gmid12 gmid23) gmid12 gmid23))
+            (if (< pk 0.05) (begin (println "FAIL: silent") (set! ok #f)))
+            (if (> pk 0.99) (begin (println "FAIL: clipping") (set! ok #f)))
+            (if (< min_target 1.0e5)
+                (begin (printf "FAIL: min target-freq energy %.2e < 1e5\n" min_target) (set! ok #f)))
+            ;; 100x is a still-very-clear separation; higher thresholds tripped
+            ;; on constrained CI runners where MT thread scheduling jitter
+            ;; produces minor spectral leakage into probed bins.
+            (if (< min_target (* 100.0 max_noise))
+                (begin (printf "FAIL: target/noise ratio < 100 (min_target=%.2e max_noise=%.2e)\n"
+                               min_target max_noise) (set! ok #f)))
+            (if ok (begin (println "PASS") 0) 1))))))
+
+;; Goertzel on a half-open frame range [start, end) of a specific channel.
+;; Factors the inner loop out of audiotest_goertzel for range-based analysis
+;; (used by audiotest_assert_sweep to probe each half of a WAV separately).
+(bind-func audiotest_goertzel_range
+  (lambda (ab:AudioBuffer* ch:i64 freq:double start:i64 end:i64)
+    (let ((nchan (AudioBuffer_channels ab))
+          (data (AudioBuffer_data ab))
+          (sr (AudioBuffer_samplerate ab))
+          (N (convert (- end start) double))
+          (k (convert (dtoi64 (+ 0.5 (/ (* N freq) sr))) double))
+          (w (* 2.0 (* 3.14159265358979323846 (/ k N))))
+          (coeff (* 2.0 (cos w)))
+          (s0:double 0.0)
+          (s1:double 0.0)
+          (s2:double 0.0)
+          (i start))
+      (while (< i end)
+        (let ((x:double 0.0)
+              (sum:double 0.0)
+              (j:i64 0))
+          (if (< ch 0)
+              (begin
+                (dotimes (j nchan)
+                  (set! sum (+ sum (convert (pref data (+ (* i nchan) j)) double))))
+                (set! x (/ sum (convert nchan double))))
+              (set! x (convert (pref data (+ (* i nchan) ch)) double)))
+          (set! s0 (+ x (- (* coeff s1) s2)))
+          (set! s2 s1)
+          (set! s1 s0))
+        (set! i (+ i 1)))
+      (+ (* s2 s2) (- (* s1 s1) (* coeff (* s1 s2)))))))
+
+;; Verify a two-segment sweep: freq_a should dominate samples
+;; [0, split_frame - guard) and freq_b should dominate
+;; [split_frame + guard, end). The ±guard window around split_frame is
+;; skipped to tolerate scheduler-callback timing jitter in offline free-run
+;; rendering (callbacks may fire several thousand samples late on busy CI).
+;; guard is expressed in samples; a typical value is 8000 (~180ms at 44.1k).
+(bind-func audiotest_assert_sweep
+  (lambda (path:i8* freq_a:double freq_b:double split_frame:i64 guard:i64)
+    (let ((ab (AudioBuffer_from_wave path)))
+      (if (null? ab)
+          (begin (printf "FAIL: could not read %s\n" path) 1)
+          (let ((nfr (AudioBuffer_frames ab))
+                (a_end (- split_frame guard))
+                (b_start (+ split_frame guard))
+                (ok #t))
+            (if (or (< a_end 100) (> b_start (- nfr 100)))
+                (begin (printf "FAIL: split_frame %lld +/- guard %lld out of range for %lld-frame file\n"
+                               split_frame guard nfr) (set! ok #f))
+                (let ((ga_first (audiotest_goertzel_range ab -1 freq_a 0 a_end))
+                      (gb_first (audiotest_goertzel_range ab -1 freq_b 0 a_end))
+                      (ga_second (audiotest_goertzel_range ab -1 freq_a b_start nfr))
+                      (gb_second (audiotest_goertzel_range ab -1 freq_b b_start nfr)))
+                  (printf "audiotest-sweep: %s  split=%lld(+-%lld)  pre[%.0f=%.2e %.0f=%.2e]  post[%.0f=%.2e %.0f=%.2e]\n"
+                          path split_frame guard
+                          freq_a ga_first freq_b gb_first
+                          freq_a ga_second freq_b gb_second)
+                  (if (< ga_first (* 10.0 gb_first))
+                      (begin (printf "FAIL: pre-split region should be %.1f Hz, not %.1f Hz\n" freq_a freq_b) (set! ok #f)))
+                  (if (< gb_second (* 10.0 ga_second))
+                      (begin (printf "FAIL: post-split region should be %.1f Hz, not %.1f Hz\n" freq_b freq_a) (set! ok #f)))))
+            (if ok (begin (println "PASS") 0) 1))))))
+
+;; CTest invocation idiom: this file is loaded via sys:load, then the xtlang
+;; assertion is called directly and its return value is handed to (quit). A
+;; pass returns 0, a fail returns 1, producing the corresponding process
+;; exit code. Example:
+;;
+;;   extempore --batch '(begin (sys:load "libs/core/audiotest.xtm")
+;;                             (quit (audiotest_assert_sine "/tmp/x.wav" 440.0)))'

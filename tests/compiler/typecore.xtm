@@ -1,0 +1,306 @@
+;;; tests/compiler/typecore.xtm -- unit tests for the canonical type core
+;;;
+;;; These exercise runtime/xtc-types.xtm in isolation: the term algebra,
+;;; Robinson unification with occurs check, substitutions, instantiation and
+;;; free-variable collection.  Several tests are written specifically to pin
+;;; down the properties whose absence causes issue #315 --- pointer depth is
+;;; carried as structure, a type variable beneath a pointer keeps its depth,
+;;; and inconsistent pointer depths are rejected rather than silently fudged.
+
+(sys:load "libs/core/test.xtm")
+(sys:load "runtime/xtc-types.xtm")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; base types          ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(xtmtest-result (if (xtc:type:unify 'i64 'i64 xtc:type:empty-subst) 1 0)
+                1
+                "base-identity")
+
+(xtmtest-result (xtc:type:unify 'i64 'i32 xtc:type:empty-subst)
+                #f
+                "base-mismatch")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; variable binding    ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:var 1)
+                  (xtc:type:unify (xtc:type:var 1) 'i64 xtc:type:empty-subst))
+                'i64
+                "var-binds-base")
+
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:var 1)
+                  (xtc:type:unify 'i64 (xtc:type:var 1) xtc:type:empty-subst))
+                'i64
+                "base-binds-var")
+
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:var 1)
+                  (xtc:type:unify (xtc:type:var 1) (xtc:type:var 2) xtc:type:empty-subst))
+                (xtc:type:var 2)
+                "var-binds-var")
+
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:var 1)
+                  (xtc:type:subst-extend 1 (xtc:type:var 2)
+                                         (xtc:type:subst-extend 2 'i64 xtc:type:empty-subst)))
+                'i64
+                "resolve-chain")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; pointer depth (#315);;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; `!a*' unified with `i64*' keeps its pointer structure ...
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:ptr (xtc:type:var 1))
+                  (xtc:type:unify (xtc:type:ptr (xtc:type:var 1))
+                                  (xtc:type:ptr 'i64)
+                                  xtc:type:empty-subst))
+                (xtc:type:ptr 'i64)
+                "ptr-depth-preserved")
+
+;; ... and binds the inner variable to the pointee, not the pointer.
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:var 1)
+                  (xtc:type:unify (xtc:type:ptr (xtc:type:var 1))
+                                  (xtc:type:ptr 'i64)
+                                  xtc:type:empty-subst))
+                'i64
+                "ptr-binds-pointee")
+
+;; `!a*' unified with `i64**' binds the variable to `i64*' --- depth is
+;; arithmetic over structure, not asterisk-counting in a symbol name.
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:var 1)
+                  (xtc:type:unify (xtc:type:ptr (xtc:type:var 1))
+                                  (xtc:type:ptr (xtc:type:ptr 'i64))
+                                  xtc:type:empty-subst))
+                (xtc:type:ptr 'i64)
+                "ptr-binds-deeper")
+
+;; The crux of #315: a generic signature (!a, !a*) applied to (i64, i64*).
+;; Binding !a=i64 from the first argument and !a*=i64* from the second must
+;; stay consistent.  The old representation corrupted this to a bogus -98.
+(xtmtest-result (let* ((s1 (xtc:type:unify (xtc:type:var 1) 'i64
+                                           xtc:type:empty-subst))
+                       (s2 (xtc:type:unify (xtc:type:ptr (xtc:type:var 1))
+                                           (xtc:type:ptr 'i64)
+                                           s1)))
+                  (and s2 (xtc:type:apply-subst (xtc:type:var 1) s2)))
+                'i64
+                "generic-two-arg-consistent")
+
+;; The same signature applied to (i64, i32*) is a genuine conflict and must be
+;; rejected, not silently unified.
+(xtmtest-result (let* ((s1 (xtc:type:unify (xtc:type:var 1) 'i64
+                                           xtc:type:empty-subst))
+                       (s2 (xtc:type:unify (xtc:type:ptr (xtc:type:var 1))
+                                           (xtc:type:ptr 'i32)
+                                           s1)))
+                  s2)
+                #f
+                "generic-two-arg-conflict")
+
+;; A pointer type does not unify with a scalar: `!a*' is not `i64'.  The old
+;; `!a*' -> `!a' collapse would have wrongly accepted this.
+(xtmtest-result (xtc:type:unify (xtc:type:ptr (xtc:type:var 1)) 'i64
+                                xtc:type:empty-subst)
+                #f
+                "ptr-not-scalar")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; occurs check        ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(xtmtest-result (xtc:type:unify (xtc:type:var 1)
+                                (xtc:type:ptr (xtc:type:var 1))
+                                xtc:type:empty-subst)
+                #f
+                "occurs-direct")
+
+(xtmtest-result (xtc:type:unify (xtc:type:var 1)
+                                (xtc:type:tuple 'i64 (xtc:type:var 1))
+                                xtc:type:empty-subst)
+                #f
+                "occurs-nested")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; compound types      ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:tuple (xtc:type:var 1) (xtc:type:var 2))
+                  (xtc:type:unify (xtc:type:tuple (xtc:type:var 1) 'i64)
+                                  (xtc:type:tuple 'f64 (xtc:type:var 2))
+                                  xtc:type:empty-subst))
+                (xtc:type:tuple 'f64 'i64)
+                "tuple-unify")
+
+(xtmtest-result (xtc:type:unify (xtc:type:tuple 'i64)
+                                (xtc:type:tuple 'i64 'i64)
+                                xtc:type:empty-subst)
+                #f
+                "tuple-arity-mismatch")
+
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:closure (xtc:type:var 1) (xtc:type:var 2))
+                  (xtc:type:unify (xtc:type:closure (xtc:type:var 1) 'i64)
+                                  (xtc:type:closure 'f64 (xtc:type:var 2))
+                                  xtc:type:empty-subst))
+                (xtc:type:closure 'f64 'i64)
+                "closure-unify")
+
+(xtmtest-result (xtc:type:unify (xtc:type:closure 'i64 'i64)
+                                (xtc:type:closure 'i64 'i64 'i64)
+                                xtc:type:empty-subst)
+                #f
+                "closure-arity-mismatch")
+
+;; array / vector sizes ride through unification as literals: equal sizes
+;; agree, unequal sizes fail, and the element type still unifies.
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:var 1)
+                  (xtc:type:unify (xtc:type:array 3 (xtc:type:var 1))
+                                  (xtc:type:array 3 'i64)
+                                  xtc:type:empty-subst))
+                'i64
+                "array-size-match")
+
+(xtmtest-result (xtc:type:unify (xtc:type:array 3 'i64)
+                                (xtc:type:array 4 'i64)
+                                xtc:type:empty-subst)
+                #f
+                "array-size-mismatch")
+
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:var 1)
+                  (xtc:type:unify (xtc:type:vector 4 (xtc:type:var 1))
+                                  (xtc:type:vector 4 'f32)
+                                  xtc:type:empty-subst))
+                'f32
+                "vector-elt-unify")
+
+;; named (nominal) types unify by name.
+(xtmtest-result (if (xtc:type:unify (xtc:type:named "string")
+                                    (xtc:type:named "string")
+                                    xtc:type:empty-subst)
+                    1 0)
+                1
+                "named-match")
+
+(xtmtest-result (xtc:type:unify (xtc:type:named "string")
+                                (xtc:type:named "list")
+                                xtc:type:empty-subst)
+                #f
+                "named-mismatch")
+
+;; nominal parametric types (napp): the name guards the match and the type
+;; arguments unify pairwise.  List{!a} reifies !a from List{i64} ...
+(xtmtest-result (xtc:type:apply-subst
+                  (xtc:type:var 1)
+                  (xtc:type:unify (xtc:type:napp "List" (xtc:type:var 1))
+                                  (xtc:type:napp "List" 'i64)
+                                  xtc:type:empty-subst))
+                'i64
+                "napp-reify-arg")
+
+;; ... but two distinct single-argument generics --- same arity, underlying
+;; shape identical --- do NOT unify, because their names differ.  This is exactly
+;; the property a structural decode (both become the same tuple) would lose.
+(xtmtest-result (xtc:type:unify (xtc:type:napp "List" 'i64)
+                                (xtc:type:napp "Stack" 'i64)
+                                xtc:type:empty-subst)
+                #f
+                "napp-nominal-distinct")
+
+;; a BARE generic name is compatible with any instance of the same name: under
+;; the old structural model the bare form (Blob's [Shape*]* against Circle's
+;; Shape{double}*) expanded with a free type variable that bound and vanished,
+;; so the two were one type --- the nominal core renders that as name equality.
+(xtmtest-result (if (xtc:type:unify (xtc:type:napp "List" 'i64)
+                                    (xtc:type:named "List")
+                                    xtc:type:empty-subst)
+                    #t #f)
+                #t
+                "napp-vs-bare-name-compatible")
+;; ... but DIFFERENT names still refuse.
+(xtmtest-result (xtc:type:unify (xtc:type:napp "List" 'i64)
+                                (xtc:type:named "Stack")
+                                xtc:type:empty-subst)
+                #f
+                "napp-vs-other-name-distinct")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; instantiation       ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Freshening preserves sharing within a single instantiation: both positions
+;; of (closure !a !a) become the same fresh variable.
+(xtmtest-result (begin (xtc:type:reset-fresh!)
+                  (xtc:type:instantiate
+                    (xtc:type:closure (xtc:type:var 5) (xtc:type:var 5))))
+                (xtc:type:closure (xtc:type:var 1) (xtc:type:var 1))
+                "instantiate-shares")
+
+;; Distinct variables stay distinct.
+(xtmtest-result (begin (xtc:type:reset-fresh!)
+                  (xtc:type:instantiate
+                    (xtc:type:closure (xtc:type:var 5) (xtc:type:var 6))))
+                (xtc:type:closure (xtc:type:var 1) (xtc:type:var 2))
+                "instantiate-distinct")
+
+;; Two independent instantiations of the same scheme never share variables ---
+;; the property `##gnum' suffixing was meant to guarantee and sometimes broke.
+(xtmtest-result (begin (xtc:type:reset-fresh!)
+                  (let ((a (xtc:type:instantiate (xtc:type:ptr (xtc:type:var 9))))
+                        (b (xtc:type:instantiate (xtc:type:ptr (xtc:type:var 9)))))
+                    (equal? a b)))
+                #f
+                "instantiate-no-collision")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; free variables      ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(xtmtest-result (xtc:type:free-vars
+                  (xtc:type:tuple (xtc:type:var 3)
+                                  (xtc:type:ptr (xtc:type:var 7))
+                                  'i64))
+                '(3 7)
+                "free-vars-collect")
+
+(xtmtest-result (xtc:type:free-vars (xtc:type:tuple 'i64 'f64))
+                '()
+                "free-vars-none")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; bare-name refinement ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; a variable holding a bare generic name (the wildcard Stream*) is refined
+;; to the instance it later unifies with, and so is every variable sharing
+;; its binding chain --- the read-back must never hand codegen the bare name
+(xtmtest-result (let* ((v (xtc:type:var 20))
+                       (w (xtc:type:var 21))
+                       (s1 (xtc:type:unify v (xtc:type:ptr (xtc:type:named "S"))
+                                           xtc:type:empty-subst))
+                       (s2 (xtc:type:unify w v s1))
+                       (s3 (xtc:type:unify w (xtc:type:ptr (xtc:type:napp "S" 'i64)) s2)))
+                  (list (xtc:type:apply-subst v s3) (xtc:type:apply-subst w s3)))
+                (list (xtc:type:ptr (xtc:type:napp "S" 'i64))
+                      (xtc:type:ptr (xtc:type:napp "S" 'i64)))
+                "refine-named-through-chain")
+
+;; the instance side is never weakened to the bare name
+(xtmtest-result (let* ((v (xtc:type:var 22))
+                       (s1 (xtc:type:unify v (xtc:type:ptr (xtc:type:napp "S" 'i64))
+                                           xtc:type:empty-subst))
+                       (s2 (xtc:type:unify v (xtc:type:ptr (xtc:type:named "S")) s1)))
+                  (xtc:type:apply-subst v s2))
+                (xtc:type:ptr (xtc:type:napp "S" 'i64))
+                "refine-named-keeps-instance")

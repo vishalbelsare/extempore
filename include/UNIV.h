@@ -36,10 +36,11 @@
 #ifndef UNIV_H
 #define UNIV_H
 
-#include <stdint.h>
-#include <BranchPrediction.h>
+#include <atomic>
+#include <cstdint>
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 
@@ -53,84 +54,81 @@
 #define EXPORT extern "C"
 #endif
 
-#if __APPLE__
-#include <CoreAudio/HostTime.h>
-#include <CoreFoundation/CFDate.h>
-#endif
-
-#if _WIN32 || _WIN64
-#if _WIN64
-#define TARGET_64BIT
-#else
-#define TARGET_32BIT
-#endif
-#endif
-
-#if __GNUC__
-#if __x86_64__ || __ppc64__
-#define TARGET_64BIT
-#else
-#define TARGET_32BIT
-#endif
-#endif
-
-#define BILLION  1000000000L
-#define D_BILLION 1000000000.0
-#define D_MILLION 1000000.0
-
-#ifdef _WIN32
-#define OS_PATH_DELIM '\\'
-#else
-#define OS_PATH_DELIM '/'
-#endif
-
 struct scheme;
-struct cell;
-typedef struct cell* pointer;
+struct s7_cell;
+typedef struct s7_cell* pointer;
 
 extern "C" {
 
 EXPORT bool rmatch(char* regex, const char* str);
-EXPORT int64_t rmatches(char* regex, char* str, char** results,int64_t maxnum); //struct regex_matched_buffer* result);
+EXPORT int64_t rmatches(char* regex, char* str, char** results,
+                        int64_t maxnum);  // struct regex_matched_buffer* result);
 EXPORT bool rsplit(const char* regex, const char* str, char* a, char* b);
 EXPORT char* rreplace(char* regex, char* str, char* replacement, char* result);
-EXPORT char* base64_encode(const unsigned char *data,size_t input_length,size_t *output_length);
-EXPORT unsigned char* base64_decode(const char *data,size_t input_length,size_t *output_length);
-EXPORT char* cname_encode(char *data,size_t input_length,size_t *output_length);
-EXPORT char* cname_decode(char *data,size_t input_length,size_t *output_length);
+EXPORT char* base64_encode(const unsigned char* data, size_t input_length, size_t* output_length);
+EXPORT unsigned char* base64_decode(const char* data, size_t input_length, size_t* output_length);
+EXPORT char* cname_encode(char* data, size_t input_length, size_t* output_length);
+EXPORT char* cname_decode(char* data, size_t input_length, size_t* output_length);
 EXPORT const char* sys_sharedir();
 EXPORT char* sys_slurp_file(const char* fname);
 EXPORT int register_for_window_events();
-
 }
 
-namespace extemp
-{
+namespace extemp {
 
-namespace UNIV
-{
+namespace UNIV {
 
+// Where the runtime files (runtime/, libs/, examples/) live.  Resolved once at
+// startup by resolve_share_dir(); pass the value of --sharedir, or an empty
+// view when it was not given.
 extern std::string SHARE_DIR;
+std::string resolve_share_dir(std::string_view explicit_dir);
 EXPORT uint32_t CHANNELS;
 EXPORT uint32_t IN_CHANNELS;
 EXPORT uint32_t SAMPLE_RATE;
-EXPORT volatile uint64_t TIME;
-extern uint64_t DEVICE_TIME;
-extern double AUDIO_CLOCK_BASE;
-extern double AUDIO_CLOCK_NOW;
+// TIME is written by the scheduler thread (TaskScheduler::timeSlice) and
+// read from every other thread; atomic<uint64_t> gives a lock-free load/
+// store on all tier-1 platforms.  DEVICE_TIME is written by the audio
+// callback and read from other threads, same story.  The xtlang JIT
+// accesses TIME via @TIME in runtime/bitcode.ll as a plain i64 load — OK
+// because the layout of std::atomic<uint64_t> is a single uint64_t on
+// all supported compilers.
+EXPORT std::atomic<uint64_t> TIME;
+extern std::atomic<uint64_t> DEVICE_TIME;
+extern std::atomic<double> AUDIO_CLOCK_BASE;
+extern std::atomic<double> AUDIO_CLOCK_NOW;
 extern uint64_t TIME_DIVISION;
-inline uint32_t SECOND() { return SAMPLE_RATE; }
-inline uint32_t MINUTE() { return SAMPLE_RATE * 60; }
-inline uint32_t HOUR() { return MINUTE() * 60; }
+inline uint32_t SECOND() {
+    return SAMPLE_RATE;
+}
+inline uint32_t MINUTE() {
+    return SAMPLE_RATE * 60;
+}
+inline uint32_t HOUR() {
+    return MINUTE() * 60;
+}
 EXPORT uint32_t NUM_FRAMES;
-extern uint32_t EXT_TERM;
+enum class TerminalMode : uint32_t {
+    Ansi = 0,
+    Cmd = 1,
+    Basic = 2,
+    NoColor = 3,
+};
+extern TerminalMode EXT_TERM;
 extern bool EXT_LOADBASE;
 extern bool AUDIO_NONE;
+extern bool BATCH_MODE;
 extern uint32_t AUDIO_DEVICE;
 extern uint32_t AUDIO_IN_DEVICE;
 extern std::string AUDIO_DEVICE_NAME;
 extern std::string AUDIO_IN_DEVICE_NAME;
 extern double AUDIO_OUTPUT_LATENCY;
+// --audio-outfile <path>: if non-empty, DSP output is written to a WAV file
+// via the offline FileAudioDriver instead of opening a PortAudio stream.
+extern std::string AUDIO_OUTFILE_PATH;
+// --duration <seconds>: optional hard cap on offline render length. 0 means
+// render until (quit) is called.
+extern double AUDIO_OUTFILE_DURATION;
 extern double CLOCK_OFFSET;
 extern std::unordered_map<std::string, std::string> CMDPARAMS;
 extern std::string ARCH;
@@ -139,76 +137,61 @@ extern std::vector<std::string> ATTRS;
 extern double midi2frq(double pitch);
 extern double frqRatio(double semitones);
 extern void initRand();
-extern bool file_check(const std::string& filename);
-extern void printSchemeCell(scheme* sc, std::stringstream& ss, pointer cell, bool = false, bool = true);
+extern void printSchemeCell(scheme* sc, std::stringstream& ss, pointer cell, bool = false,
+                            bool = true);
 
-}
+}  // namespace UNIV
 
-}
+}  // namespace extemp
 
 #ifdef _WIN32
-#include <chrono>
 #include <Windows.h>
 #endif
 
+#include <chrono>
+
 // clock/time
-#ifdef _WIN32
-
-extern "C" inline double getRealTime()
-{
-    return double(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count()) / D_BILLION;
+//
+// Wall-clock seconds since the Unix epoch, uniform across platforms via
+// std::chrono::system_clock (Unix-epoch wall time everywhere). This replaced
+// three per-platform clocks: the Windows high_resolution_clock had a
+// boot-relative epoch (wrong for the cross-machine clock sync that consumes
+// it), while Linux's clock_gettime(CLOCK_REALTIME) and the macOS CoreFoundation
+// clock both returned exactly the Unix wall time system_clock already provides.
+extern "C" inline double getRealTime() {
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
-#elif __linux__
-#include <time.h>
-
-extern "C" inline double getRealTime()
-{
-    struct timespec t;
-    clock_gettime(CLOCK_REALTIME, &t);
-    return t.tv_sec + t.tv_nsec / D_BILLION;
-}
-
-#elif __APPLE__
-
-#include <CoreAudio/HostTime.h>
-
-extern "C" inline double getRealTime()
-{
-    return CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970;
-}
-
-#endif
-
-inline void ascii_text_color(bool Bold, unsigned Foreground, unsigned Background)
-{
-    if (unlikely(extemp::UNIV::EXT_TERM == 3)) {
+inline void ascii_text_color(bool Bold, unsigned Foreground, unsigned Background) {
+    if (extemp::UNIV::EXT_TERM == extemp::UNIV::TerminalMode::NoColor) [[unlikely]] {
         return;
     }
 #ifdef _WIN32
     extern int WINDOWS_COLORS[];
-    extern int WINDOWS_BGCOLORS[];    
-    if (unlikely(extemp::UNIV::EXT_TERM == 1)) {
-      Foreground = (Foreground > 7) ? 7 : Foreground;
-      Background = (Background > 7) ? 0 : Background;
-      HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
-      if (Background > 0) {
-        SetConsoleTextAttribute(console, WINDOWS_COLORS[Foreground] | WINDOWS_BGCOLORS[Background]);
-      } else {
-        SetConsoleTextAttribute(console, WINDOWS_COLORS[Foreground]);
-      }
-      return;
+    extern int WINDOWS_BGCOLORS[];
+    if (extemp::UNIV::EXT_TERM == extemp::UNIV::TerminalMode::Cmd) [[unlikely]] {
+        Foreground = (Foreground > 7) ? 7 : Foreground;
+        Background = (Background > 7) ? 0 : Background;
+        HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (Background > 0) {
+            SetConsoleTextAttribute(console,
+                                    WINDOWS_COLORS[Foreground] | WINDOWS_BGCOLORS[Background]);
+        } else {
+            SetConsoleTextAttribute(console, WINDOWS_COLORS[Foreground]);
+        }
+        return;
     }
-#endif //#else
+#endif  // #else
     // if simple term (that doesn't support defaults)
     // then default to black background and white text
     Foreground = (Foreground > 9 || Foreground == 8) ? 9 : Foreground;
     Background = (Background > 9 || Background == 8) ? 9 : Background;
-    if (unlikely(extemp::UNIV::EXT_TERM == 2)) {
-        if (unlikely(Background == 9)) {
+    if (extemp::UNIV::EXT_TERM == extemp::UNIV::TerminalMode::Basic) [[unlikely]] {
+        if (Background == 9) [[unlikely]] {
             Background = 0;
         }
-        if (unlikely(Foreground == 9)) {
+        if (Foreground == 9) [[unlikely]] {
             Foreground = 7;
         }
     }
@@ -216,10 +199,20 @@ inline void ascii_text_color(bool Bold, unsigned Foreground, unsigned Background
     // #endif
 }
 
-inline void ascii_default() { ascii_text_color(false, 9, 9); }
-inline void ascii_normal() { ascii_text_color(false, 7, 9); }
-inline void ascii_error() { ascii_text_color(true, 1, 9); }
-inline void ascii_warning() { ascii_text_color(true, 3, 9); }
-inline void ascii_info() { ascii_text_color(true, 6, 9); }
+inline void ascii_default() {
+    ascii_text_color(false, 9, 9);
+}
+inline void ascii_normal() {
+    ascii_text_color(false, 7, 9);
+}
+inline void ascii_error() {
+    ascii_text_color(true, 1, 9);
+}
+inline void ascii_warning() {
+    ascii_text_color(true, 3, 9);
+}
+inline void ascii_info() {
+    ascii_text_color(true, 6, 9);
+}
 
 #endif

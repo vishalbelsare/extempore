@@ -1,0 +1,278 @@
+;;; tests/compiler/typebridge.xtm -- conversions between canonical terms and
+;;; the live int-code representation (runtime/xtc-types-bridge.xtm)
+;;;
+;;; The corpus below is ground truth taken from the existing parser
+;;; (xtc:codegen:get-type-from-pretty-str), so a passing round-trip certifies that
+;;; the canonical representation is faithful to the encoding the rest of the
+;;; compiler already uses.
+
+(sys:load "libs/core/test.xtm")
+(sys:load "runtime/xtc-types.xtm")
+(sys:load "runtime/xtc-types-bridge.xtm")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; round-trip corpus   ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; For every int-code, decoding to a term then re-encoding must be the
+;; identity.  The test returns the codes that fail to round-trip, so a failure
+;; names exactly which encodings broke; an empty list means all passed.
+(xtmtest-result
+  (let ((corpus (list 2 102 202 0 1 4 108 10
+                      '(14 2 0) '(114 2 0) '(214 2 0)
+                      '(15 4 2) '(115 4 2) '(16 4 1)
+                      '(113 2 2) '(213 2 2) '(313 2 2)
+                      '(14 2 (14 0 1)) '(14 2 (114 0 1))
+                      '(213 2 (114 0 1))
+                      '(15 3 (14 2 0)))))
+    (cl:remove-if
+      (lambda (ic)
+        (equal? ic (xtc:type:to-intcode (xtc:type:from-intcode ic (make-hashtable)))))
+      corpus))
+  '()
+  "intcode-roundtrip")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; explicit decode     ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(xtmtest-result (xtc:type:from-intcode 102 (make-hashtable))
+                (xtc:type:ptr 'i64)
+                "decode-pointer")
+
+(xtmtest-result (xtc:type:from-intcode '(114 2 0) (make-hashtable))
+                (xtc:type:ptr (xtc:type:tuple 'i64 'f64))
+                "decode-pointer-tuple")
+
+;; the everyday boxed closure decodes to a pointer-to-closure
+(xtmtest-result (xtc:type:from-intcode '(213 2 2) (make-hashtable))
+                (xtc:type:ptr (xtc:type:closure 'i64 'i64))
+                "decode-boxed-closure")
+
+;; the bare (unboxed) closure has no extra pointer
+(xtmtest-result (xtc:type:from-intcode '(113 2 2) (make-hashtable))
+                (xtc:type:closure 'i64 'i64)
+                "decode-bare-closure")
+
+(xtmtest-result (xtc:type:from-intcode '(15 4 2) (make-hashtable))
+                (xtc:type:array 4 'i64)
+                "decode-array")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; explicit encode     ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(xtmtest-result (xtc:type:to-intcode (xtc:type:ptr (xtc:type:tuple 'i64 'f64)))
+                '(114 2 0)
+                "encode-pointer-tuple")
+
+(xtmtest-result (xtc:type:to-intcode (xtc:type:ptr (xtc:type:closure 'i64 'i64)))
+                '(213 2 2)
+                "encode-boxed-closure")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; named types         ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(xtmtest-result (xtc:type:from-intcode "%string" (make-hashtable))
+                (xtc:type:named "string")
+                "decode-named")
+
+(xtmtest-result (xtc:type:to-intcode (xtc:type:ptr (xtc:type:named "string")))
+                "%string*"
+                "encode-named-pointer")
+
+(xtmtest-result (xtc:type:to-intcode
+                  (xtc:type:from-intcode "%foo**" (make-hashtable)))
+                "%foo**"
+                "named-roundtrip")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; bang-variable intern ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; !a and !a* share one variable (the inner term of !a* is !a) --- this is the
+;; pointer-depth-bearing variable whose absence causes #315.
+(xtmtest-result (let ((tbl (make-hashtable)))
+                  (let ((a  (xtc:type:from-intcode '!a tbl))
+                        (a* (xtc:type:from-intcode '!a* tbl)))
+                    (equal? a (xtc:type:ptr-to a*))))
+                #t
+                "bang-shares-across-depth")
+
+;; the same call-site suffix interns to the same variable ...
+(xtmtest-result (let ((tbl (make-hashtable)))
+                  (equal? (xtc:type:from-intcode (string->symbol "!a##3") tbl)
+                          (xtc:type:from-intcode (string->symbol "!a##3") tbl)))
+                #t
+                "bang-same-callsite")
+
+;; ... but distinct call sites do not.
+(xtmtest-result (let ((tbl (make-hashtable)))
+                  (equal? (xtc:type:from-intcode (string->symbol "!a##3") tbl)
+                          (xtc:type:from-intcode (string->symbol "!a##7") tbl)))
+                #f
+                "bang-distinct-callsites")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; pretty <-> term     ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Parsing a surface type string then rendering it back is the identity, for
+;; concrete types and for types carrying bang variables alike --- the property
+;; the canonical reification relies on.
+(xtmtest-result
+  (let ((corpus (list "i64" "i64*" "double" "<i64,double>" "<i64,double>*"
+                      "[i64,i64]*" "|4,double|" "/4,float/"
+                      "!a*" "<!a*,i64>" "<!a*,!b>" "<!a,<!b,i64>>")))
+    (cl:remove-if
+      (lambda (s)
+        (let* ((tbl (make-hashtable)) (term (xtc:type:from-pretty s tbl)))
+          (string=? s (xtc:type:to-pretty term tbl))))
+      corpus))
+  '()
+  "pretty-roundtrip")
+
+;; a tuple field !a* parses to a pointer-to-variable
+(xtmtest-result (let ((tbl (make-hashtable)))
+                  (xtc:type:ptr? (cadr (xtc:type:from-pretty "<!a*,i64>" tbl))))
+                #t
+                "pretty-field-is-pointer")
+
+;; !a and !a* in one type share a single variable
+(xtmtest-result (let* ((tbl (make-hashtable))
+                       (term (xtc:type:from-pretty "<!a,!a*>" tbl)))
+                  (equal? (cadr term) (xtc:type:ptr-to (caddr term))))
+                #t
+                "pretty-shares-variable")
+
+;; substituting the variable's binding reifies the field with its depth intact
+(xtmtest-result (let* ((tbl (make-hashtable))
+                       (term (xtc:type:from-pretty "<!a*,i64>" tbl))
+                       (v (xtc:type:from-pretty "!a" tbl))
+                       (subst (xtc:type:unify v 'i64 xtc:type:empty-subst)))
+                  (xtc:type:to-pretty (xtc:type:apply-subst term subst) tbl))
+                "<i64*,i64>"
+                "reify-keeps-depth")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; pointer-depth core  ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; reduce and deepen are structural inverses on concrete int-codes.  This is the
+;; #315 parameter/field relationship made structural: a type variable's depth-0
+;; binding (its base, !a = i64) re-deepens to the starred occurrence (!a* =
+;; i64*), and a depth-1 value strips back to the base, both via the unifier
+;; rather than star arithmetic.
+(xtmtest-result (xtc:type:deepen-ptr-depth 2 1) 102 "deepen-base")
+(xtmtest-result (xtc:type:deepen-ptr-depth 2 2) 202 "deepen-twice")
+(xtmtest-result (xtc:type:deepen-ptr-depth '(14 2 0) 1) '(114 2 0) "deepen-tuple")
+(xtmtest-result (xtc:type:deepen-ptr-depth "%Foo" 1) "%Foo*" "deepen-named")
+(xtmtest-result (xtc:type:reduce-ptr-depth (xtc:type:deepen-ptr-depth 2 2) 2)
+                2 "deepen-reduce-roundtrip")
+
+;; a concrete value shallower than the requested reduction has no inverse: the
+;; unifier reports 'fail rather than underflowing to a bogus code.  (update-var
+;; reads this to drop the #315 conflation of !a* with a depth-0 value.)
+(xtmtest-result (xtc:type:reduce-ptr-depth 2 1) 'fail "reduce-underflow-fails")
+
+;; the type parameters of a template are its free variables by identity ---
+;; depth-independent, deduplicated, in first-seen order --- the bare !a, never
+;; the field usage !a*.
+(xtmtest-result (xtc:type:pretty-type-params "<!a*,i64>")  '("!a")      "params-depth1")
+(xtmtest-result (xtc:type:pretty-type-params "<!a**,i64>") '("!a")      "params-depth2")
+(xtmtest-result (xtc:type:pretty-type-params "<!a*,!b>")   '("!a" "!b") "params-two")
+(xtmtest-result (xtc:type:pretty-type-params "<!a,!a*>")   '("!a")      "params-shared")
+
+;; a recursive template's self-reference and its non-variable fields are not
+;; parameters, however the surface parser expands them
+(xtmtest-result (xtc:type:pretty-type-params "<!a,i8*,SchedEvt*,SchedEvt*>")
+                '("!a") "params-recursive-fields")
+(xtmtest-result (xtc:type:pretty-type-params "<!a,[Stream*]*>")
+                '("!a") "params-recursive-closure")
+(xtmtest-result (xtc:type:pretty-type-params "<i64,Circle{!a}*,Rect{!b}*>")
+                '("!a" "!b") "params-nested-instances")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; nominal generics    ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A generic-instance type round-trips through a nominal (napp name arg...) term:
+;; the opaque poly c-name %List_poly_<base64-of-"<i64>"> decodes to (napp "List"
+;; i64) under its pointer, and re-encodes to exactly the same c-name --- so a
+;; generic that returns a container reads back as the live compiler spells it.
+;; PGk2ND4 is the (deterministic) base64 of the type-argument string "<i64>".
+(xtmtest-result (xtc:type:from-intcode "%List_poly_PGk2ND4*" (make-hashtable))
+                (xtc:type:ptr (xtc:type:napp "List" 'i64))
+                "napp-decode")
+
+;; the ENCODE, by contrast, registers the instance type on first use by running
+;; its pretty spelling through the old parser (the c-name choke point in
+;; xtc-types-bridge.xtm), so it needs the List generictype itself registered ---
+;; in live compilation it always is, because a napp term for List can only
+;; arise after (bind-type List ...).  Mirror adt.xtm's definition here.
+(bind-type List <!a,List*>)
+
+(xtmtest-result (xtc:type:to-intcode (xtc:type:ptr (xtc:type:napp "List" 'i64)))
+                "%List_poly_PGk2ND4*"
+                "napp-encode")
+
+;; a candidate pattern (carrying a bang variable) decodes --- via split-namedtype,
+;; needing no registered generictype --- to a napp with a variable argument, which
+;; unifies with the concrete instance to reify it back to the same c-name: the
+;; generic-call reification, in miniature.
+(xtmtest-result (let* ((intern (make-hashtable))
+                       (pat (xtc:type:from-intcode "List{!a}*" intern))
+                       (subst (xtc:type:unify
+                                pat
+                                (xtc:type:from-intcode "%List_poly_PGk2ND4*" intern)
+                                xtc:type:empty-subst)))
+                  (xtc:type:to-intcode (xtc:type:apply-subst pat subst)))
+                "%List_poly_PGk2ND4*"
+                "napp-pattern-reifies")
+
+;; The parser's value is memoised by string (xtc:codegen:get-type-from-pretty-str);
+;; its one effect --- instantiating a generic instance that is not yet a named
+;; type --- happens where the parser meets the instance, and clears the memo.
+
+(xtmtest-result (let ((fresh (begin (xtc:cache:invalidate-type-parse-memo!)
+                                    (xtc:codegen:get-type-from-pretty-str "<i64,double>*"))))
+                  (list (if (hashtable-ref *xtc:cache:type-parse-memo* "<i64,double>*") 'memoised 'not-memoised)
+                        (equal? fresh (xtc:codegen:get-type-from-pretty-str "<i64,double>*"))))
+                '(memoised #t)
+                "parse-memoised-and-stable")
+
+;; two instances inside one tuple, one of them twice: each is registered once
+(xtmtest-result (let* ((before (hashtable-count *xtc:cache:namedtype-cache*))
+                       (t (xtc:codegen:get-type-from-pretty-str "<List{i1}*,List{i1}*,List{i16}*>"))
+                       (added (- (hashtable-count *xtc:cache:namedtype-cache*) before)))
+                  (list added
+                        (xtc:cache:namedtype-exists? (cadr t))
+                        (xtc:cache:namedtype-exists? (cadddr t))))
+                '(2 #t #t)
+                "nested-instances-instantiated-once-each")
+
+;; An instance first met inside another instance's parse must be registered
+;; right there: generating the outer _poly_ cname pretty-prints the inner
+;; instance, and pretty-print-type re-parses an unknown %name until it
+;; resolves.  With the registration deferred to the end of the outer parse
+;; that was an endless loop, seen as an intermittent hang in
+;; tests/core/generics.xtm (whether the inner instance had been met earlier
+;; depended on the run).
+(bind-type TBInner <!a,!a>)
+(bind-type TBOuter <i64,TBInner{!a}*>)
+(xtmtest-result (let ((outer (xtc:codegen:get-type-from-pretty-str "TBOuter:<i64,TBInner:<i16,i16>*>*")))
+                  (list (xtc:codegen:pretty-print-type outer)
+                        (xtc:cache:namedtype-exists? outer)
+                        (xtc:cache:namedtype-exists? (xtc:codegen:get-type-from-pretty-str "TBInner:<i16,i16>*"))))
+                '("TBOuter{i16}*" #t #t)
+                "inner-instance-registered-during-outer-parse")
+
+;; registering a type clears the memo (a bare name can parse differently once
+;; it names a type or an alias)
+(xtmtest-result (begin
+                  (xtc:codegen:get-type-from-pretty-str "<i32,i32>")
+                  (bind-alias ProbeAliasXYZ i64)
+                  (if (hashtable-ref *xtc:cache:type-parse-memo* "<i32,i32>") 'stale 'cleared))
+                'cleared
+                "registrar-clears-memo")

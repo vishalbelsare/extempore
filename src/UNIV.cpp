@@ -34,20 +34,26 @@
  */
 
 #include "UNIV.h"
-#include <math.h>
-#include <stdlib.h>
-#include <stdio.h>
+#include <cmath>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <regex>
 #include <string>
+#include <string_view>
 #include <sstream>
 #include <iosfwd>
 #include <iomanip>
-#include "pcre.h"
 #include "SchemeFFI.h"
-#include "SchemePrivate.h"
+#include "SchemeS7Private.h"
+#include "ext/FileUtil.h"
+#include "ext/ShareDir.h"
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #include <AppKit/AppKit.h>
+#include <mach-o/dyld.h>
 #else
 #include <time.h>
 #endif
@@ -56,71 +62,63 @@
 #include <malloc.h>
 #include <Windows.h>
 
-enum Windows_Color_Convert
-{
-    Black   = 0,
-    Red     = FOREGROUND_RED,
-    Green   = FOREGROUND_GREEN,
-    Yellow  = FOREGROUND_RED   | FOREGROUND_GREEN | FOREGROUND_INTENSITY,
-    Blue    = FOREGROUND_BLUE  | FOREGROUND_INTENSITY,
-    Magenta = FOREGROUND_RED   | FOREGROUND_BLUE,
-    Cyan    = FOREGROUND_GREEN | FOREGROUND_BLUE,
-    White   = FOREGROUND_RED   | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY
+enum Windows_Color_Convert {
+    Black = 0,
+    Red = FOREGROUND_RED,
+    Green = FOREGROUND_GREEN,
+    Yellow = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY,
+    Blue = FOREGROUND_BLUE | FOREGROUND_INTENSITY,
+    Magenta = FOREGROUND_RED | FOREGROUND_BLUE,
+    Cyan = FOREGROUND_GREEN | FOREGROUND_BLUE,
+    White = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY
 };
 
-enum Windows_BGColor_convert
-{
-    BGBlack   = 0,
-    BGRed     = BACKGROUND_RED,
-    BGGreen   = BACKGROUND_GREEN,
-    BGYellow  = BACKGROUND_RED   | BACKGROUND_GREEN | BACKGROUND_INTENSITY,
-    BGBlue    = BACKGROUND_BLUE,
-    BGMagenta = BACKGROUND_RED   | BACKGROUND_BLUE,
-    BGCyan    = BACKGROUND_GREEN | BACKGROUND_BLUE,
-    BGWhite   = BACKGROUND_RED   | BACKGROUND_GREEN | BACKGROUND_BLUE | BACKGROUND_INTENSITY,
+enum Windows_BGColor_convert {
+    BGBlack = 0,
+    BGRed = BACKGROUND_RED,
+    BGGreen = BACKGROUND_GREEN,
+    BGYellow = BACKGROUND_RED | BACKGROUND_GREEN | BACKGROUND_INTENSITY,
+    BGBlue = BACKGROUND_BLUE,
+    BGMagenta = BACKGROUND_RED | BACKGROUND_BLUE,
+    BGCyan = BACKGROUND_GREEN | BACKGROUND_BLUE,
+    BGWhite = BACKGROUND_RED | BACKGROUND_GREEN | BACKGROUND_BLUE | BACKGROUND_INTENSITY,
 };
 
-int WINDOWS_COLORS[] = { Black, Red, Green, Yellow, Blue, Magenta, Cyan, White };
-int WINDOWS_BGCOLORS[] = { BGBlack, BGRed, BGGreen, BGYellow, BGBlue, BGMagenta, BGCyan, BGWhite };
+int WINDOWS_COLORS[] = {Black, Red, Green, Yellow, Blue, Magenta, Cyan, White};
+int WINDOWS_BGCOLORS[] = {BGBlack, BGRed, BGGreen, BGYellow, BGBlue, BGMagenta, BGCyan, BGWhite};
 
 #endif
 
-static char base64_codesafe_encoding_table[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
-                                                'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
-                                                'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X',
-                                                'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
-                                                'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
-                                                'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
-                                                'w', 'x', 'y', 'z', '0', '1', '2', '3',
-                                                '4', '5', '6', '7', '8', '9', '_', '-'};
+static char base64_codesafe_encoding_table[] = {
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+    'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
+    'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+    'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '_', '-'};
 
-static char base64_std_encoding_table[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
-                                           'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
-                                           'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X',
-                                           'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
-                                           'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
-                                           'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
-                                           'w', 'x', 'y', 'z', '0', '1', '2', '3',
-                                           '4', '5', '6', '7', '8', '9', '+', '/'};
+static char base64_std_encoding_table[] = {
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+    'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
+    'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+    'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/'};
 
-static char *base64_std_decoding_table = NULL;
-static char *base64_codesafe_decoding_table = NULL;
+static char* base64_std_decoding_table = nullptr;
+static char* base64_codesafe_decoding_table = nullptr;
 static int _base64_mod_table[] = {0, 2, 1};
 
 void base64_std_build_decoding_table() {
 
-  base64_std_decoding_table = (char*) malloc(256);
+    base64_std_decoding_table = (char*)malloc(256);
 
     for (int i = 0; i < 64; i++)
-        base64_std_decoding_table[(unsigned char) base64_std_encoding_table[i]] = i;
+        base64_std_decoding_table[(unsigned char)base64_std_encoding_table[i]] = i;
 }
 
 void base64_codesafe_build_decoding_table() {
 
-  base64_codesafe_decoding_table = (char*) malloc(256);
+    base64_codesafe_decoding_table = (char*)malloc(256);
 
     for (int i = 0; i < 64; i++)
-        base64_codesafe_decoding_table[(unsigned char) base64_codesafe_encoding_table[i]] = i;
+        base64_codesafe_decoding_table[(unsigned char)base64_codesafe_encoding_table[i]] = i;
 }
 
 void base64_std_cleanup() {
@@ -131,14 +129,14 @@ void base64_codesafe_cleanup() {
     free(base64_codesafe_decoding_table);
 }
 
-EXPORT char* cname_encode(char *data, size_t input_length, size_t *output_length)
-{
+EXPORT char* cname_encode(char* data, size_t input_length, size_t* output_length) {
     *output_length = 4 * ((input_length + 2) / 3);
 
-    //char *encoded_data = (char*) malloc(*output_length);
-    char *encoded_data = (char*) malloc(*output_length+1);
+    // char *encoded_data = (char*) malloc(*output_length);
+    char* encoded_data = (char*)malloc(*output_length + 1);
+    if (encoded_data == nullptr)
+        return nullptr;
     encoded_data[*output_length] = 0;
-    if (encoded_data == NULL) return NULL;
 
     for (unsigned i = 0, j = 0; i < input_length;) {
 
@@ -155,68 +153,84 @@ EXPORT char* cname_encode(char *data, size_t input_length, size_t *output_length
     }
 
     for (int i = 0; i < _base64_mod_table[input_length % 3]; i++) {
-      encoded_data[*output_length - 1 - i] = 0; //'$';
+        encoded_data[*output_length - 1 - i] = 0;  //'$';
     }
 
-    //printf("ENCODE: %d:%s\n",*output_length,encoded_data);
+    // printf("ENCODE: %d:%s\n",*output_length,encoded_data);
     return encoded_data;
 }
 
-EXPORT char* cname_decode(char *data, size_t input_length, size_t *output_length)
-{
-    if (base64_codesafe_decoding_table == NULL) base64_codesafe_build_decoding_table();
+EXPORT char* cname_decode(char* data, size_t input_length, size_t* output_length) {
+    if (base64_codesafe_decoding_table == nullptr)
+        base64_codesafe_build_decoding_table();
 
-    char* d2 = NULL;
-    // pad with $'s
+    // Pad with $'s to align to 4 bytes. pad_buf is separate from the outer
+    // scope so we always know which buffer to free at the end.
+    char* pad_buf = nullptr;
     if (input_length % 4 != 0) {
-      int lgthdiff = (4-(input_length % 4));
-      char* d2 = (char*) malloc(input_length+lgthdiff);
-      memcpy(d2,data,input_length);
-      input_length = input_length+lgthdiff;
-      for(int i=0;i<lgthdiff;i++) {
-        d2[input_length-1-i] = '$';
-      }
-      data = d2;
+        int lgthdiff = (4 - (input_length % 4));
+        pad_buf = (char*)malloc(input_length + lgthdiff);
+        memcpy(pad_buf, data, input_length);
+        input_length = input_length + lgthdiff;
+        for (int i = 0; i < lgthdiff; i++) {
+            pad_buf[input_length - 1 - i] = '$';
+        }
+        data = pad_buf;
     }
 
-    if (input_length % 4 != 0) return NULL;
+    if (input_length % 4 != 0) {
+        if (pad_buf)
+            free(pad_buf);
+        return nullptr;
+    }
     *output_length = input_length / 4 * 3;
-    if (data[input_length - 1] == '$') (*output_length)--;
-    if (data[input_length - 2] == '$') (*output_length)--;
+    if (data[input_length - 1] == '$')
+        (*output_length)--;
+    if (data[input_length - 2] == '$')
+        (*output_length)--;
 
-    char *decoded_data = (char*) malloc(*output_length+1);
+    char* decoded_data = (char*)malloc(*output_length + 1);
+    if (decoded_data == nullptr) {
+        if (pad_buf)
+            free(pad_buf);
+        return nullptr;
+    }
     decoded_data[*output_length] = 0;
-    if (decoded_data == NULL) return NULL;
+
+    auto fetch = [&](unsigned& i) -> uint32_t {
+        unsigned char c = static_cast<unsigned char>(data[i++]);
+        return c == '$' ? 0u : base64_codesafe_decoding_table[c];
+    };
 
     for (unsigned i = 0, j = 0; i < input_length;) {
+        uint32_t sextet_a = fetch(i);
+        uint32_t sextet_b = fetch(i);
+        uint32_t sextet_c = fetch(i);
+        uint32_t sextet_d = fetch(i);
 
-        uint32_t sextet_a = data[i] == '$' ? 0 & i++ : base64_codesafe_decoding_table[unsigned(data[i++])];
-        uint32_t sextet_b = data[i] == '$' ? 0 & i++ : base64_codesafe_decoding_table[unsigned(data[i++])];
-        uint32_t sextet_c = data[i] == '$' ? 0 & i++ : base64_codesafe_decoding_table[unsigned(data[i++])];
-        uint32_t sextet_d = data[i] == '$' ? 0 & i++ : base64_codesafe_decoding_table[unsigned(data[i++])];
+        uint32_t triple =
+            (sextet_a << 3 * 6) + (sextet_b << 2 * 6) + (sextet_c << 1 * 6) + (sextet_d << 0 * 6);
 
-        uint32_t triple = (sextet_a << 3 * 6)
-        + (sextet_b << 2 * 6)
-        + (sextet_c << 1 * 6)
-        + (sextet_d << 0 * 6);
-
-        if (j < *output_length) decoded_data[j++] = (triple >> 2 * 8) & 0xFF;
-        if (j < *output_length) decoded_data[j++] = (triple >> 1 * 8) & 0xFF;
-        if (j < *output_length) decoded_data[j++] = (triple >> 0 * 8) & 0xFF;
+        if (j < *output_length)
+            decoded_data[j++] = (triple >> 2 * 8) & 0xFF;
+        if (j < *output_length)
+            decoded_data[j++] = (triple >> 1 * 8) & 0xFF;
+        if (j < *output_length)
+            decoded_data[j++] = (triple >> 0 * 8) & 0xFF;
     }
-    if (d2) free(d2);
-    //printf("DECODE: %d:%s\n",*output_length,decoded_data);
+    if (pad_buf)
+        free(pad_buf);
     return decoded_data;
 }
 
-EXPORT char* base64_encode(const unsigned char *data, size_t input_length, size_t *output_length)
-{
+EXPORT char* base64_encode(const unsigned char* data, size_t input_length, size_t* output_length) {
     *output_length = 4 * ((input_length + 2) / 3);
 
-    char *encoded_data = (char*) malloc(*output_length+1);
-    encoded_data[*output_length]=0;
+    char* encoded_data = (char*)malloc(*output_length + 1);
+    if (encoded_data == nullptr)
+        return nullptr;
 
-    if (encoded_data == NULL) return NULL;
+    encoded_data[*output_length] = 0;
 
     for (unsigned i = 0, j = 0; i < input_length;) {
 
@@ -238,376 +252,249 @@ EXPORT char* base64_encode(const unsigned char *data, size_t input_length, size_
     return encoded_data;
 }
 
+EXPORT unsigned char* base64_decode(const char* data, size_t input_length, size_t* output_length) {
+    if (base64_std_decoding_table == nullptr)
+        base64_std_build_decoding_table();
 
-EXPORT unsigned char* base64_decode(const char *data, size_t input_length, size_t *output_length)
-{
-    if (base64_std_decoding_table == NULL) base64_std_build_decoding_table();
-
-    if (input_length % 4 != 0) return NULL;
+    if (input_length % 4 != 0)
+        return nullptr;
 
     *output_length = input_length / 4 * 3;
-    if (data[input_length - 1] == '=') (*output_length)--;
-    if (data[input_length - 2] == '=') (*output_length)--;
+    if (data[input_length - 1] == '=')
+        (*output_length)--;
+    if (data[input_length - 2] == '=')
+        (*output_length)--;
 
-    unsigned char *decoded_data = (unsigned char*) malloc(*output_length);
-    if (decoded_data == NULL) return NULL;
+    unsigned char* decoded_data = (unsigned char*)malloc(*output_length);
+    if (decoded_data == nullptr)
+        return nullptr;
+
+    auto fetch = [&](unsigned& i) -> uint32_t {
+        unsigned char c = static_cast<unsigned char>(data[i++]);
+        return c == '=' ? 0u : base64_std_decoding_table[c];
+    };
 
     for (unsigned i = 0, j = 0; i < input_length;) {
 
-        uint32_t sextet_a = data[i] == '=' ? 0 & i++ : base64_std_decoding_table[unsigned(data[i++])];
-        uint32_t sextet_b = data[i] == '=' ? 0 & i++ : base64_std_decoding_table[unsigned(data[i++])];
-        uint32_t sextet_c = data[i] == '=' ? 0 & i++ : base64_std_decoding_table[unsigned(data[i++])];
-        uint32_t sextet_d = data[i] == '=' ? 0 & i++ : base64_std_decoding_table[unsigned(data[i++])];
+        uint32_t sextet_a = fetch(i);
+        uint32_t sextet_b = fetch(i);
+        uint32_t sextet_c = fetch(i);
+        uint32_t sextet_d = fetch(i);
 
-        uint32_t triple = (sextet_a << 3 * 6)
-        + (sextet_b << 2 * 6)
-        + (sextet_c << 1 * 6)
-        + (sextet_d << 0 * 6);
+        uint32_t triple =
+            (sextet_a << 3 * 6) + (sextet_b << 2 * 6) + (sextet_c << 1 * 6) + (sextet_d << 0 * 6);
 
-        if (j < *output_length) decoded_data[j++] = (triple >> 2 * 8) & 0xFF;
-        if (j < *output_length) decoded_data[j++] = (triple >> 1 * 8) & 0xFF;
-        if (j < *output_length) decoded_data[j++] = (triple >> 0 * 8) & 0xFF;
+        if (j < *output_length)
+            decoded_data[j++] = (triple >> 2 * 8) & 0xFF;
+        if (j < *output_length)
+            decoded_data[j++] = (triple >> 1 * 8) & 0xFF;
+        if (j < *output_length)
+            decoded_data[j++] = (triple >> 0 * 8) & 0xFF;
     }
 
     return decoded_data;
 }
 
-EXPORT bool rmatch(char* regex, const char* str)
-{
-  //  char* data = char* strstring_value(pair_car(args));
-  // char* pattern = string_value(pair_cadr(args));
-  const char* data = str;
-  char* pattern = regex;
-
-  pcre *re;
-  const char *error;
-  int erroffset;
-
-  re = pcre_compile(    pattern, /* the pattern */
-                        0, /* default options */
-                        &error, /* for error message */
-                        &erroffset, /* for error offset */
-                        NULL); /* use default character tables */
-
-  int rc;
-  int ovector[30];
-  rc = pcre_exec(       re, /* result of pcre_compile() */
-                        NULL, /* we didn’t study the pattern */
-                        data, /* the subject string */
-                        strlen(data), /* the length of the subject string */
-                        0, /* start at offset 0 in the subject */
-                        0, /* default options */
-                        ovector, /* vector of integers for substring information */
-                        30); /* number of elements (NOT size in bytes) */
-
-  return (rc>=0) ? true : false;
-}
-
-
-// bool rmatches(char* regex, char* str, struct regex_matched_buffer* result)
-//     {
-//   char* data = str;
-//   char* pattern = regex;
-//      pcre *re;
-//      const char *error;
-//      int erroffset;
-//      re = pcre_compile(      pattern, /* the pattern */
-//                              0, /* default options */
-//                              &error, /* for error message */
-//                              &erroffset, /* for error offset */
-//                              NULL); /* use default character tables */
-
-//      int rc;
-//      int ovector[60];
-//      rc = pcre_exec( re, /* result of pcre_compile() */
-//                      NULL, /* we didn’t study the pattern */
-//                      data, /* the subject string */
-//                      strlen(data), /* the length of the subject string */
-//                      0, /* start at offset 0 in the subject */
-//                      0, /* default options */
-//                      ovector, /* vector of integers for substring information */
-//                      60); /* number of elements (NOT size in bytes) */
-
-//      // if failed to match return empty list
-//      if(rc<0 || rc>100) return false;
-
-//   result->matches = rc;
-//      for(int i=0, p=0, k=(rc-1);i<rc;i++,k--)
-//      {
-//          //std::cout << "RC: " << rc << " " << ovector[p] << "::" << ovector[p+1] << std::endl;
-//     p=i*2;
-
-//        if(ovector[p]==-1) {
-//       strcpy(result->data[k],"");
-//        }else{
-//       int range = ovector[p+1] - ovector[p];
-//       char* b = (char*) alloca(range+1);
-//       memset(b,0,range+1);
-//       char* a = data+ovector[p];
-//       char* substring = strncpy(b, a, range);
-//       strcpy(result->data[k],substring);
-//        }
-//      }
-//   return true;
-// }
-
-
-EXPORT int64_t rmatches(char* regex, char* str, char** results, int64_t maxnum)
-    {
-  char* data = str;
-  char* pattern = regex;
-        pcre *re;
-        const char *error;
-        int erroffset;
-        re = pcre_compile(      pattern, /* the pattern */
-                                0, /* default options */
-                                &error, /* for error message */
-                                &erroffset, /* for error offset */
-                                NULL); /* use default character tables */
-
-        // pointer to hold return results
-        int rc;
-        int ovector[60];
-  int64_t num=0;
-
-        while(true) {
-            rc = pcre_exec(     re, /* result of pcre_compile() */
-                                NULL, /* we didn’t study the pattern */
-                                data, /* the subject string */
-                                strlen(data), /* the length of the subject string */
-                                0, /* start at offset 0 in the subject */
-                                0, /* default options */
-                                ovector, /* vector of integers for substring information */
-                                60); /* number of elements (NOT size in bytes) */
-
-            //std::cout << data << " RC: " << rc << " " << ovector[0] << "::" << ovector[1] << "  num " << num << " max " << maxnum << std::endl;
-            if(rc<1 || num>=maxnum) {
-        return num;
-            }
-            int range = ovector[1] - ovector[0];
-            char* b = (char*) alloca(range+1);
-            b[range] = '\0';
-            char* a = data+ovector[0];
-            char* substring = strncpy(b, a, range);
-      // std::cout << "substr:" << substring << std::endl;
-      char* tmp = (char*) malloc(range+1);
-      tmp[range] = '\0';
-      strncpy(tmp,substring,range);
-      // std::cout << "adding:" << tmp << " at:" << num << std::endl;
-      results[num]=tmp;
-      // std::cout << "done!" << std::endl;
-      num++;
-            //_sc->imp_env->insert(list);
-            data = data+range+ovector[0];
-        }
-  return 0;
-}
-
-EXPORT bool rsplit(const char* regex, const char* str, char* a, char* b)
-{ // TODO: harmonize with FFI
-  int length = strlen(str);
-  pcre *re;
-  const char *error;
-  int erroffset;
-  //printf("dat: str\n");
-  // should probably move this regex compile to global
-  re = pcre_compile(    regex, /* the regex */
-                        0, /* default options */
-                        &error, /* for error message */
-                        &erroffset, /* for error offset */
-                        NULL); /* use default character tables */
-  int rc;
-  int ovector[60];
-  rc = pcre_exec(       re, /* result of pcre_compile() */
-                        NULL, /* we didn’t study the regex */
-                        str, /* the subject string */
-                        strlen(str), /* the length of the subject string */
-                        0, /* start at offset 0 in the subject */
-                        0, /* default options */
-                        ovector, /* vector of integers for substring information */
-                        60); /* number of elements (NOT size in bytes) */
-
-  if(rc<1 || rc>1) return false; // then we failed
-  int range = ovector[0];
-  int range2 = ovector[1];
-  //printf("reg ranges %d:%d\n",range,range2);
-  a[range] = '\0';;
-  memcpy(a, str, range);
-  b[length - range2] = '\0';
-  memcpy(b, str + range2, length - range2);
-  return true;
-}
-
-
-// returns char* result
-EXPORT char* rreplace(char* regex, char* str, char* replacement, char* result) {
-
-  char* data = str; //string_value(pair_car(args));
-        char* pattern = regex; //string_value(pair_cadr(args));
-  char* replace = replacement;
-        //strcpy(result,replacement);
-
-        pcre *re;
-        const char *error;
-        int erroffset;
-        re = pcre_compile(      pattern, /* the pattern */
-                                0, /* default options */
-                                &error, /* for error message */
-                                &erroffset, /* for error offset */
-                                NULL); /* use default character tables */
-
-        int rc;
-        int ovector[60];
-
-        rc = pcre_exec( re, /* result of pcre_compile() */
-                        NULL, /* we didn’t study the pattern */
-                        data, /* the subject string */
-                        strlen(data), /* the length of the subject string */
-                        0, /* start at offset 0 in the subject */
-                        0, /* default options */
-                        ovector, /* vector of integers for substring information */
-                        60); /* number of elements (NOT size in bytes) */
-
-        // no match found return original string
-        if(rc<1) {strcpy(result,str); return result;} // Return mk_string(_sc,data);
-        // ok we have a match
-        // first replace any groups in replace string (i.e. $1 $2 ...)
-        char* res = (char*) "";
-        char* sep = (char*) "$";
-        char* tmp = 0;
-  int datalength = strlen(data);
-        int pos,range,size,cnt = 0;
-  strcpy(result,replace);
-        char* p = strtok(result,sep);
-  if(p==NULL) { strcpy(result, str); return result; };
-        do{
-            char* cc;
-            pos = strtol(p,&cc,10);
-      // std::cout << "p: " << p << " pos: " << pos << " cc:" << cc << std::endl;
-            range = (pos>0 && pos<20) ? ovector[(pos*2)+1] - ovector[pos*2] : 0;
-      // std::cout << "cnt: " << cnt << " rc:" << rc << " range: " << range << std::endl;
-      if(pos>=rc || range < 0 || range > datalength) {
-        range = 0;
-        cc = p;
-      }
-            size = strlen(res);
-            tmp = (char*) alloca(size+range+strlen(cc)+1);
-            tmp[size+range+strlen(cc)] = '\0';
-            memcpy(tmp,res,size);
-            memcpy(tmp+size,data+ovector[pos*2],range);
-            memcpy(tmp+size+range,cc,strlen(cc));
-            res = tmp;
-            p = strtok(NULL, sep);
-      cnt++;
-        }while(p);
-        // now we can use "rep" to replace the original regex match (i.e. ovector[0]-ovector[1])
-        int lgth = ovector[0] + strlen(res) + strlen(data) - ovector[1] + 1;
-        range = ovector[1] - ovector[0];
-        //char* result = (char*) alloca(lgth);
-        if(lgth>4096) return str;
-        result[lgth - 1] = '\0'; // TODO: lots of this can be simplified
-        memcpy(result,data,ovector[0]);
-        memcpy(result+ovector[0],res,strlen(res));
-        memcpy(result+ovector[0]+strlen(res),data+ovector[1],strlen(data)-ovector[1]);
-        return result;
-}
-
-EXPORT const char* sys_sharedir(){
-  return extemp::UNIV::SHARE_DIR.c_str();
-}
-
-EXPORT char* sys_slurp_file(const char* fname)
-{
-    std::string filename(fname);
-    std::string sharedir_filename(extemp::UNIV::SHARE_DIR + "/" + filename);
-
-    // check raw path first, then prepend SHARE_DIR
-    std::FILE *fp = std::fopen(filename.c_str(), "rb");
-    if (!fp) {
-      fp = std::fopen(sharedir_filename.c_str(), "rb");
+EXPORT bool rmatch(char* regex, const char* str) {
+    try {
+        std::regex re(regex);
+        return std::regex_search(str, re);
+    } catch (const std::regex_error&) {
+        return false;
     }
-
-  if(fp){
-    std::fseek(fp, 0, SEEK_END);
-    size_t file_size = std::ftell(fp);
-    char* buf = (char*)malloc(file_size*sizeof(char));
-    std::rewind(fp);
-    std::fread(buf, 1, file_size, fp);
-    std::fclose(fp);
-
-    buf[file_size-1] = '\0';
-    return buf;
-  }
-  return NULL;
 }
 
-EXPORT int register_for_window_events()
-{
+EXPORT int64_t rmatches(char* regex, char* str, char** results, int64_t maxnum) {
+    try {
+        std::string s(str);
+        std::regex re(regex);
+        int64_t num = 0;
+        auto begin = std::sregex_iterator(s.begin(), s.end(), re);
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end && num < maxnum; ++it) {
+            std::string match = (*it)[0].str();
+            char* tmp = (char*)malloc(match.length() + 1);
+            strcpy(tmp, match.c_str());
+            results[num] = tmp;
+            num++;
+        }
+        return num;
+    } catch (const std::regex_error&) {
+        return 0;
+    }
+}
+
+EXPORT bool rsplit(const char* regex, const char* str, char* a, char* b) {
+    // Callers in libs/core/adt.xtm allocate 2048-byte buffers for a and b.
+    // Bail rather than write past the buffer. A proper API with explicit
+    // capacity is tracked as a follow-up backlog task.
+    constexpr size_t kAssumedBufSize = 2048;
+    try {
+        std::regex re(regex);
+        std::cmatch m;
+        if (!std::regex_search(str, m, re) || m.size() != 1)
+            return false;
+        size_t range = static_cast<size_t>(m.position(0));
+        size_t range2 = range + static_cast<size_t>(m.length(0));
+        size_t length = strlen(str);
+        if (range >= kAssumedBufSize || (length - range2) >= kAssumedBufSize)
+            return false;
+        memcpy(a, str, range);
+        a[range] = '\0';
+        memcpy(b, str + range2, length - range2);
+        b[length - range2] = '\0';
+        return true;
+    } catch (const std::regex_error&) {
+        return false;
+    }
+}
+
+EXPORT char* rreplace(char* regex, char* str, char* replacement, char* result) {
+    // Callers (libs/core/adt.xtm) allocate a 4096-byte result buffer and read
+    // it directly, so always write a valid NUL-terminated string and never run
+    // past the buffer --- truncate rather than overflow. A capacity-aware API
+    // is tracked as a follow-up backlog task.
+    constexpr size_t kAssumedBufSize = 4096;
+    const char* out = str; // fall back to the original on oversize / regex error
+    std::string res;
+    try {
+        std::regex re(regex);
+        res = std::regex_replace(std::string(str), re, std::string(replacement),
+                                 std::regex_constants::format_first_only);
+        if (res.length() < kAssumedBufSize)
+            out = res.c_str();
+    } catch (const std::regex_error&) {
+        // out stays pointed at str
+    }
+    size_t n = strnlen(out, kAssumedBufSize - 1);
+    memcpy(result, out, n);
+    result[n] = '\0';
+    return result;
+}
+
+EXPORT const char* sys_sharedir() {
+    return extemp::UNIV::SHARE_DIR.c_str();
+}
+
+EXPORT char* sys_slurp_file(const char* fname) {
+    // Try the raw path first, then prepend SHARE_DIR.
+    if (char* buf = extemp::file_util::slurp_file(fname)) {
+        return buf;
+    }
+    std::string sharedir_filename(extemp::UNIV::SHARE_DIR + "/" + fname);
+    return extemp::file_util::slurp_file(sharedir_filename.c_str());
+}
+
+EXPORT int register_for_window_events() {
 #ifdef __APPLE__
-  // to give Extempore it's own dock icon, etc
-  return (int)[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    // to give Extempore it's own dock icon, etc
+    return (int)[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 #else
-  // implement the required "receive events" functionality for Linux
-  // or Windows if necessary
-  return 1;
+    // implement the required "receive events" functionality for Linux
+    // or Windows if necessary
+    return 1;
 #endif
 }
 
-namespace extemp
-{
+namespace {
 
-namespace UNIV
-{
+// The absolute path of the running executable, or an empty path if the platform
+// call fails.  Symlinks are resolved, so a link on $PATH (a mise shim, a
+// /usr/local/bin symlink) still names the real install.
+std::filesystem::path executable_path() {
+    std::filesystem::path raw;
+#ifdef _WIN32
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD len = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (len == 0) {
+            return {};
+        }
+        if (len < buf.size()) {
+            buf.resize(len);
+            raw = std::filesystem::path(buf);
+            break;
+        }
+        buf.resize(buf.size() * 2);
+    }
+#elif defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);  // sets size, always "fails"
+    std::string buf(size, '\0');
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) {
+        return {};
+    }
+    buf.resize(std::strlen(buf.c_str()));
+    raw = std::filesystem::path(buf);
+#else
+    {
+        std::error_code ec;
+        raw = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (ec) {
+            return {};
+        }
+    }
+#endif
+    std::error_code ec;
+    auto resolved = std::filesystem::canonical(raw, ec);
+    return ec ? raw : resolved;
+}
+
+}  // namespace
+
+namespace extemp {
+
+namespace UNIV {
+
+std::string resolve_share_dir(std::string_view explicit_dir) {
+    auto exe = executable_path();
+    return share_dir::pick(explicit_dir, exe.empty() ? exe : exe.parent_path(), EXT_SHARE_DIR);
+}
 
 std::string SHARE_DIR = std::string(EXT_SHARE_DIR);
 uint32_t NUM_FRAMES = 1024;
 uint32_t CHANNELS = 2;
 uint32_t IN_CHANNELS = 0;
 uint32_t SAMPLE_RATE = 44100;
-volatile uint64_t TIME = 0l;
-uint64_t DEVICE_TIME = 0l;
-double AUDIO_CLOCK_NOW = 0.0;
-double AUDIO_CLOCK_BASE = 0.0;
+std::atomic<uint64_t> TIME{0};
+std::atomic<uint64_t> DEVICE_TIME{0};
+static_assert(std::atomic<uint64_t>::is_always_lock_free,
+              "std::atomic<uint64_t> must be lock-free so the xtlang JIT's "
+              "plain i64 loads of @TIME remain compatible");
+static_assert(std::atomic<double>::is_always_lock_free,
+              "std::atomic<double> must be lock-free so the realtime audio "
+              "callback can publish the clock without blocking");
+std::atomic<double> AUDIO_CLOCK_NOW = 0.0;
+std::atomic<double> AUDIO_CLOCK_BASE = 0.0;
 uint64_t TIME_DIVISION = 1;
 bool AUDIO_NONE = false;
+bool BATCH_MODE = false;
 uint32_t AUDIO_DEVICE = -1;
 uint32_t AUDIO_IN_DEVICE = -1;
 std::string AUDIO_DEVICE_NAME;
 std::string AUDIO_IN_DEVICE_NAME;
 double AUDIO_OUTPUT_LATENCY = 0.0;
+std::string AUDIO_OUTFILE_PATH;
+double AUDIO_OUTFILE_DURATION = 0.0;
 double CLOCK_OFFSET = 0.0;
 std::unordered_map<std::string, std::string> CMDPARAMS;
 std::string ARCH;
 std::string CPU;
 std::vector<std::string> ATTRS;
 
-// 0 is for ansi, 1 is for MSDos CMD shell
 #ifdef _WIN32
-uint32_t EXT_TERM = 1;
+TerminalMode EXT_TERM = TerminalMode::Cmd;
 #else
-uint32_t EXT_TERM = 0;
+TerminalMode EXT_TERM = TerminalMode::Ansi;
 #endif
 bool EXT_LOADBASE = true;
 
-double midi2frq(double pitch)
-{
-    return 220.0 * pow(2.0,(pitch - 57.0)/12);
+double midi2frq(double pitch) {
+    return 220.0 * pow(2.0, (pitch - 57.0) / 12);
 }
 
-double frqRatio(double semitones)
-{
-    return pow(2.0, (semitones/12.0));
-}
-
-bool file_check(const std::string& filename)
-{
-    FILE* fd = fopen(filename.c_str(),"r");
-    if(fd == NULL){
-        return false;
-    }else{
-        fclose(fd);
-        return true;
-    }
+double frqRatio(double semitones) {
+    return pow(2.0, (semitones / 12.0));
 }
 
 struct dump_stack_frame {
@@ -617,161 +504,106 @@ struct dump_stack_frame {
     pointer code;
 };
 
-
-void printSchemeCell(scheme* _sc, std::stringstream& ss, pointer val, bool full, bool stringquotes)
-{
-    if(val == 0) {
+void printSchemeCell(scheme* _sc, std::stringstream& ss, pointer val, bool full,
+                     bool stringquotes) {
+    if (val == 0) {
         ss << "-ERROR BAD POINTER-";
         return;
     }
-    if (pointer_type(val) > T_LAST_SYSTEM_TYPE) {
-        printf("Bad cell type - not printing\n");
-        return;
-    }
 
-    if(is_string(val)) {
-        if(stringquotes) {
+    // Use s7's object->string for a general fallback, but handle common types
+    // explicitly for formatting compatibility with the previous TinyScheme output.
+
+    if (val == _sc->NIL) {
+        ss << (full ? "()" : "NIL");
+    } else if (val == _sc->T) {
+        ss << "#t";
+    } else if (val == _sc->F) {
+        ss << "#f";
+    } else if (val == _sc->EOF_OBJ) {
+        ss << "#<EOF>";
+    } else if (is_string(val)) {
+        if (stringquotes) {
             ss << "\"" << string_value(val) << "\"";
-        }else{
+        } else {
             ss << string_value(val);
         }
-    }else if(is_symbol(val)){
+    } else if (is_symbol(val)) {
         ss << symname(val);
-    }else if(is_character(val)){
+    } else if (is_character(val)) {
         ss << charvalue(val);
-    }else if(is_environment(val)){
-        ss << "#<ENVIRONMENT " << val << " ";
-        if(full) {
-            if(is_vector(val->_object._cons._car)) {
-                ss << "<VECTOR-FRAME>";
-            }else{
-                printSchemeCell(_sc, ss, val->_object._cons._car, full, stringquotes);
-            }
-            ss << " ";
-            printSchemeCell(_sc, ss, val->_object._cons._cdr, full, stringquotes);
+    } else if (is_integer(val)) {
+        ss << ivalue(val);
+    } else if (is_rational(val)) {
+        ss << s7_numerator(val) << "/" << s7_denominator(val);
+    } else if (is_number(val)) {
+        if (full) {
+            ss << std::fixed << std::showpoint << std::setprecision(23) << rvalue(val);
+        } else {
+            ss << std::fixed << std::showpoint << rvalue(val);
         }
-        ss << ">";
-    }else if(is_proc(val)){
-        ss << "#<PROC " << procname(val) << ">";
-    }else if(is_foreign(val)){
-        ss << "#<FOREIGN>";
-    }else if(is_macro(val)){
-        ss << "#<MACRO>";
-    }else if(is_closure(val)){
-        ss << "#<<CLOSURE " << val << ">";
-        if(full) {
-            ss << "<CODE ";
-            printSchemeCell(_sc, ss, val->_object._cons._car, full, stringquotes);
-            ss << "> ";
-            printSchemeCell(_sc, ss, val->_object._cons._cdr, full, stringquotes);
-            ss << ">>";
-        }
-    }else if(is_continuation(val)){
-        ss << "#<<CONTINUATION " << val << ">";
-        if(full) {
-            unsigned int* stack = (unsigned int*) cptr_value(pair_cdr(val));
-            int nframes = stack[0];
-            dump_stack_frame* frames = (dump_stack_frame*)&stack[1];
-            for(int j=0;j<nframes;j++)
-            {
-                ss << std::endl << std::endl << "FRAME(" << j << ")--------------------------";
-                ss << std::endl << "OPCODE: " << frames[j].op; // << std::endl << "----------" << std::endl;
-
-                // print args
-                ss << std::endl << "ARGS: ";
-                pointer args = frames[j].args;
-                extemp::UNIV::printSchemeCell(_sc, ss, args, true, stringquotes);
-
-                // copy code
-                ss << std::endl << "CODE: ";
-                pointer code = frames[j].code;
-                //          ss.str("");
-                extemp::UNIV::printSchemeCell(_sc, ss, code, true, stringquotes);
-                //          std::cout << "CODE" << std::endl << ss.str() << std::endl << "-----------" << std::endl;
-
-                ss << std::endl << "ENVIR: ";
-                pointer envir = frames[j].envir;
-                //          ss.str("");
-                extemp::UNIV::printSchemeCell(_sc, ss, envir, true, stringquotes);
-                //          std::cout << "ENVIR" << std::endl << ss.str() << std::endl << "-----------" << std::endl;
-            }
-        }
-        ss << std::endl << ">>";
-    }else if(is_cptr(val)){
+    } else if (is_cptr(val)) {
         void* p = cptr_value(val);
         ss << "#<CPTR: " << p << ">";
-    }else if(is_vector(val)){
-        //ss << "#<VECTOR>";
-        if(true) {
-            ss << "#(";
-            int i;
-            long long num=val->_size;//  /2+ivalue_unchecked(val)%2;
-            if(num > 1000 && !full) { // exit if larger than 1000 elements
-                ss << " -- " << num << " elements -- )";
-                return;
-            }
-            //std::cout << "  NUM: " << num << std::endl;
-            for(i=0; i<num; i++) {
-                /* Vector cells will be treated like ordinary cells */
-                printSchemeCell(_sc, ss, vector_elem(val,i), full, stringquotes);
-                if(i+1 < num) ss << " ";
-            }
-            ss << ")";
-        }
-    }else if(is_port(val)){
-        ss << "#<PORT" << val << ">";
-    }else if(is_pair(val)){
-        int lgth = list_length(_sc, val);
-        if(lgth<0) // is pair
-        {
-            ss << "(";
-            printSchemeCell(_sc, ss, val->_object._cons._car, full, stringquotes);
-            ss << " . ";
-            printSchemeCell(_sc, ss, val->_object._cons._cdr, full, stringquotes);
-            ss << ")";
-        }else if(lgth>1000 && !full) {
-            ss << "( -- " << lgth << " elements -- )";
+    } else if (is_vector(val)) {
+        ss << "#(";
+        long long num = vector_length(val);
+        if (num > 1000 && !full) {
+            ss << " -- " << num << " elements -- )";
             return;
-        }else{ // is list
+        }
+        for (long long i = 0; i < num; i++) {
+            printSchemeCell(_sc, ss, vector_elem(val, i), full, stringquotes);
+            if (i + 1 < num)
+                ss << " ";
+        }
+        ss << ")";
+    } else if (is_pair(val)) {
+        int lgth = list_length(_sc, val);
+        if (lgth < 0) {
             ss << "(";
-            for(int i=0;i<lgth;i++)
-            {
-                printSchemeCell(_sc, ss, list_ref(_sc, i, val), full, stringquotes);
-                if(i<(lgth-1)) ss << " ";
+            printSchemeCell(_sc, ss, pair_car(val), full, stringquotes);
+            ss << " . ";
+            printSchemeCell(_sc, ss, pair_cdr(val), full, stringquotes);
+            ss << ")";
+        } else if (lgth > 1000 && !full) {
+            ss << "( -- " << lgth << " elements -- )";
+        } else {
+            ss << "(";
+            for (pointer p = val; is_pair(p); p = pair_cdr(p)) {
+                printSchemeCell(_sc, ss, pair_car(p), full, stringquotes);
+                if (is_pair(pair_cdr(p)))
+                    ss << " ";
             }
             ss << ")";
         }
-    }else if(is_foreign(val)){
-        ss << "#<FOREIGN FUNC>";
-    }else if(val == _sc->NIL){
-        if(full) {
-            ss << "()";
-        }else{
-            ss << "NIL";
+    } else if (is_environment(val)) {
+        ss << "#<ENVIRONMENT " << val << ">";
+    } else if (is_closure(val)) {
+        ss << "#<CLOSURE " << val << ">";
+        if (full) {
+            char* repr = s7_object_to_c_string(_sc->sc, val);
+            if (repr) {
+                ss << " " << repr;
+                free(repr);
+            }
         }
-    }else if(_sc->T == val){
-        ss << "#t";
-    }else if(_sc->F == val){
-        ss << "#f";
-    }else if(is_integer(val)){
-        ss << ivalue(val);
-    }else if(is_rational(val)){
-        ss << val->_object._number.value.ratvalue.n << "/" << val->_object._number.value.ratvalue.d;
-    }else if(is_real(val)){
-        if(full){
-            ss << std::fixed << std::showpoint << std::setprecision(23) << rvalue(val);
-        }else{
-            ss << std::fixed << std::showpoint << /* << std::setprecision(15) <<*/ rvalue(val);
+    } else if (is_proc(val) || is_foreign(val)) {
+        char* repr = s7_object_to_c_string(_sc->sc, val);
+        ss << (repr ? repr : "#<PROCEDURE>");
+        free(repr);
+    } else {
+        // Fallback: use s7's object->string
+        char* repr = s7_object_to_c_string(_sc->sc, val);
+        if (repr) {
+            ss << repr;
+            free(repr);
+        } else {
+            ss << "#<UNKNOWN " << val << ">";
         }
-    }else if(_sc->EOF_OBJ == val){
-      ss << "#<EOF>";
-    }else{
-        ss << "UNKOWN VALUE: " << val << " (GC'd?) ";
     }
-
-    return;
 }
 
-}
+}  // namespace UNIV
 
-} //End Namespace
+}  // namespace extemp

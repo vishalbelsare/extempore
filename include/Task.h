@@ -36,52 +36,75 @@
 #ifndef IMP_TASK_H
 #define IMP_TASK_H
 
-#include <iostream>
-
-#include "CM.h"
 #include <cstdint>
+#include <functional>
+#include <utility>
 
 namespace extemp {
 
-class TaskI
-{
-private:
+class TaskI;
+
+// What a scheduled task runs when it fires. Held by pointer -- Scheme sees it
+// as a cptr (*callback*, *io:osc:send-msg*) and TaskScheduler::addTask takes
+// one -- so instances are heap objects that outlive the tasks using them.
+class CM {
+  private:
+    std::function<void(TaskI*)> m_function;
+
+  public:
+    explicit CM(std::function<void(TaskI*)> Function) : m_function(std::move(Function)) {}
+
+    void execute(TaskI* Task) {
+        m_function(Task);
+    }
+};
+
+// A CM calling `instance->func(task)`.
+#define mk_cb(instance, class, func)                                                               \
+    (new extemp::CM([instance](extemp::TaskI* task) { (instance)->func(task); }))
+
+class TaskI {
+  private:
     uint64_t m_startTime;
     uint64_t m_duration;
-    CM*      m_classMember;
-    int      m_tag;
-    bool     m_isCallback;
-    bool     m_active;
-    bool     m_isAumidi;
-protected:
-    TaskI(uint64_t StartTime, uint64_t Duration, CM* ClassMember, int Tag, bool Callback = false):
-            m_startTime(StartTime), m_duration(Duration), m_classMember(ClassMember), m_tag(Tag), m_isCallback(Callback),
-            m_active(true), m_isAumidi(false) {
-    }
-public:
+    CM* m_classMember;
+    int m_tag;
+
+  protected:
+    // Callback is accepted for the callers that pass it and otherwise unused.
+    TaskI(uint64_t StartTime, uint64_t Duration, CM* ClassMember, int Tag, bool /*Callback*/ = false)
+        : m_startTime(StartTime), m_duration(Duration), m_classMember(ClassMember), m_tag(Tag) {}
+
+  public:
     virtual ~TaskI() = default;
 
-    void setStartTime(uint64_t StartTime) { m_startTime = StartTime; }
-    uint64_t getStartTime() const { return m_startTime; }
-    uint64_t getDuration() const { return m_duration; }
-    int getTag() const { return m_tag; }
-    bool isActive() const { return m_active; }
-    bool isCallback() const { return m_isCallback; }
-    void execute() { m_classMember->execute(this); }
-};
-
-template<typename T = int>
-class Task: public TaskI
-{
-private:
-    T m_arg;
-public:
-    Task(uint64_t StartTime, uint64_t Duration, CM* ClassMember, const T& Arg, int Tag = 0, bool Callback = false):
-            TaskI(StartTime, Duration, ClassMember, Tag, Callback), m_arg(Arg) {
+    uint64_t getStartTime() const {
+        return m_startTime;
     }
-
-    const T& getArg() const { return m_arg; }
+    uint64_t getDuration() const {
+        return m_duration;
+    }
+    int getTag() const {
+        return m_tag;
+    }
+    void execute() {
+        m_classMember->execute(this);
+    }
 };
 
-} //End Namespace
+template <typename T = int> class Task : public TaskI {
+  private:
+    T m_arg;
+
+  public:
+    Task(uint64_t StartTime, uint64_t Duration, CM* ClassMember, const T& Arg, int Tag = 0,
+         bool Callback = false)
+        : TaskI(StartTime, Duration, ClassMember, Tag, Callback), m_arg(Arg) {}
+
+    const T& getArg() const {
+        return m_arg;
+    }
+};
+
+}  // namespace extemp
 #endif

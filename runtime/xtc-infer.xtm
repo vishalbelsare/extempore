@@ -1,0 +1,1509 @@
+;;; xtc-infer.xtm --- constraint-emitting inference traversal
+;;;
+;;; This is the compiler's type-inference front: it walks the AST and emits a
+;;; flat list of clean constraints (eq / default --- see xtc-solve.xtm) which the
+;;; substitution solver then discharges in one pass.  No candidate sets, no
+;;; number-crunch, no enumeration retry loop.  (It began as the strangler
+;;; replacement for the candidate-list traversal in xtc:typecheck:type-check,
+;;; shadow-validated against it and then flipped live; the old family is
+;;; deleted --- TASK-059.)  It errors loudly on any form it does not handle ---
+;;; so a coverage gap is visible, never silent.
+;;;
+;;; Covered: numeric/bool literals, symbols, let, begin, if, binary
+;;; arithmetic, comparison, lambda, the application of a *local* closure (a
+;;; let-bound or lambda-bound variable in call position), and the application of
+;;; a *global* function --- a bind-lib native, a bound closure, or a bind-func
+;;; (registered as a polyfunc, monomorphic or overloaded).  A global call emits
+;;; one overload constraint over the callee's candidate signatures (see
+;;; xtc-solve.xtm); the solver picks the candidate the arguments select.  A
+;;; monomorphic function is just the one-candidate case --- the overload still
+;;; carries the class check, so an integer literal will not silently bind to a
+;;; floating-point parameter (the candidate's class excludes it).
+;;;
+;;; A binary arithmetic or comparison operator is itself an overloaded call: its
+;;; candidates are the builtin numeric widths --- (w w w) for arithmetic, (i1 w w)
+;;; for comparison --- plus any user xtm_addition / xtm_lessthan / ... overloads
+;;; registered for non-numeric operands.  So (+ 1 2) selects a numeric width and
+;;; (+ c1 c2) on two Complexd tuples selects the Complexd xtm_addition candidate,
+;;; exactly as the old path's xtm_addition## rewrite did --- one overload
+;;; constraint, resolved by the operand types.  (A free literal transiently
+;;; matches more than one width; the literal's default then pins it and the
+;;; ambiguity collapses --- the same defaulting interleave the solver already
+;;; uses for any overload.)
+;;;
+;;; A generic function (genericfunc, not polyfunc) is also resolved through the
+;;; overload: its candidate signatures carry bang variables --- (!a !a),
+;;; (!a !a*), or a named generic type like (!a "IPair{!a,!b}*") --- which the
+;;; solver freshens per candidate and unifies with the arguments, so the return
+;;; type is REIFIED from the args rather than selected.  A named generic type
+;;; argument unifies NOMINALLY: the int-code bridge decodes both a concrete
+;;; instance (the opaque poly c-name %Name_poly_<...>) and a candidate's pattern
+;;; (Name{!a,...}) to a (napp name arg...) term, so List{i64} and a same-shaped
+;;; Pair{i64,i64} do NOT cross-unify (their napp names differ) and a recursive
+;;; type like List needs no expansion --- the name carries the recursion.  When
+;;; several specialisations share a name the overload picks the one that unifies.
+;;; A fully-general fallback whose return is free (first's [!a,!b]*) is filtered
+;;; out of the overload (xtc:infer:sig-reifiable?) so it does not shadow a
+;;; specific one; when NO specialisation matches the argument, that fallback is
+;;; reified instead by exercising its body --- a field projection (tref a i) ---
+;;; against the concrete argument type (xtc:infer:collect-generic-call), the
+;;; structural analogue of the old path's "exercise the generic code".  A
+;;; genericfunc is preferred over its compiled monomorphic instances, which cover
+;;; only the types already specialised.
+;;;
+;;; Deferred, a loud gap kept out of the corpus: constraint-guarded
+;;; specialisations (the cache's predicate field), and a free-return fallback
+;;; whose argument is NON-ground --- one referring to an outer variable not bound
+;;; here, so its body cannot be exercised --- which awaits expected-type
+;;; direction from the surrounding context.
+;;;
+;;; The clean unifier is intentionally
+;;; stricter than the old candidate-list path was on implicit numeric coercion;
+;;; two cases the old path silently
+;;; coerced: a narrower numeric *result* flowing into a wider parameter (an i32
+;;; result into an i64 parameter), and a bare integer *literal* passed where a
+;;; floating-point parameter is wanted (the old single-candidate path forces the
+;;; literal across; the overload's class check declines it, since an integer
+;;; literal does not range over the float widths).  Both are the same
+;;; coercion-versus-conflict question the migration sets out to replace.
+;;;
+;;; A form's *result* is named by a key: either a fresh type variable (a
+;;; !infer_N symbol), a program variable symbol (which is its own type
+;;; variable), or a concrete int-code for a form whose type is already known
+;;; (e.g. a boolean is i1).  A closure's key is a closure int-code whose return
+;;; and argument slots are themselves keys --- (213 result-key arg-key ...) ---
+;;; so a lambda and a call to it relate through ordinary Robinson unification of
+;;; two closure terms, no separate function-type vocabulary required.
+;;; xtc:infer:collect returns (cons result-key constraints); constraints relate
+;;; keys via the int-code vocabulary the solver already speaks.
+;;;
+;;; The traversal threads a `bound' set --- the lexically in-scope local
+;;; variables --- purely to decide whether a symbol in call position is a local
+;;; closure (handled here) or something global (a coverage gap, so a loud
+;;; error).  Types still flow through constraints, never through `bound'; it
+;;; carries identity, not type.
+
+;; A monotonic source of fresh result-variable names, distinct (the !infer_
+;; prefix) from any program or bang variable so they never collide in the solve.
+(define *xtc:infer:fresh-counter* 0)
+
+(define xtc:infer:reset-fresh!
+  (lambda () (set! *xtc:infer:fresh-counter* 0)))
+
+(define xtc:infer:fresh-key
+  (lambda ()
+    (set! *xtc:infer:fresh-counter* (+ *xtc:infer:fresh-counter* 1))
+    (string->symbol (string-append "!infer_" (number->string *xtc:infer:fresh-counter*)))))
+
+;; The numeric defaulting classes, single-sourced from the codegen constants and
+;; ordered so the solver's (apply min) picks the canonical default (si64 / fp64).
+;; The class is also the literal's VIABILITY bound (what widths it may take when
+;; a use demands one --- the old path's number-check + crunch), so an integer
+;; literal ranges over every integer width its value fits: 0 and 1 reach down to
+;; i1, anything under 256 fits the 8-bit widths, everything else stops at 16
+;; bits.  Float widths are deliberately absent --- a bare int literal does not
+;; implicitly become a float (the one place this path is stricter by design).
+(define xtc:infer:int-class
+  (lambda (v)
+    (let ((wide (list *xtc:codegen:si64* *xtc:codegen:ui64*
+                      *xtc:codegen:si32* *xtc:codegen:ui32*
+                      *xtc:codegen:si16* *xtc:codegen:ui16*)))
+      (cond ((or (= v 0) (= v 1))
+             (append wide (list *xtc:codegen:si8* *xtc:codegen:ui8* *xtc:codegen:i1*)))
+            ((< v 256)
+             (append wide (list *xtc:codegen:si8* *xtc:codegen:ui8*)))
+            (else wide)))))
+
+(define xtc:infer:float-class
+  (lambda () (list *xtc:codegen:fp64* *xtc:codegen:fp32*)))
+
+;; Every scalar numeric width, the candidate parameter types a builtin math or
+;; comparison operator ranges over (matching xtc:codegen:number?).  A literal is
+;; held to its own narrower default class; a concrete operand selects its exact
+;; width; the surplus widths are simply never viable.
+(define xtc:infer:numeric-class
+  (lambda ()
+    (list *xtc:codegen:fp64* *xtc:codegen:fp32*
+          *xtc:codegen:si64* *xtc:codegen:ui64*
+          *xtc:codegen:si32* *xtc:codegen:ui32*
+          *xtc:codegen:si16* *xtc:codegen:ui16*
+          *xtc:codegen:si8*  *xtc:codegen:ui8*
+          *xtc:codegen:i1*   *xtc:codegen:char*)))
+
+;; The binary arithmetic / bitwise operators (+ - * / % modulo bitwise-*): each is
+;; an overloaded call whose operands share a numeric width.  Only the five
+;; arithmetic ones carry a user xtm_ overload (for tuple operands); modulo and the
+;; bitwise ops range over the integer widths alone.
+(define xtc:infer:math-op?
+  (lambda (s) (and (member s *xtc:globals:mathbinaryaritylist*) #t)))
+
+;; The unary/binary/ternary real-valued math intrinsics (sqrt sin pow fma ...):
+;; every argument and the result share one (real) type.
+(define xtc:infer:math-intrinsic?
+  (lambda (s) (and (member s *xtc:globals:mathintrinsicslist*) #t)))
+
+(define xtc:infer:compare-op?
+  (lambda (s) (and (member s '(< > = <>)) #t)))
+
+;; The boxed-closure int-code head: the closure tag carries an intrinsic box, so
+;; the pointer you pass around sits at depth 2 (213 = 13 + 2*100).  A closure key
+;; is (closure-head result-key arg-key ...) --- the same shape lambda-check emits
+;; --- so it decodes through the bridge as (ptr (closure ...)) and round-trips.
+(define xtc:infer:closure-code
+  (lambda (result-key arg-keys)
+    (cons (+ *xtc:codegen:closure* (* 2 *xtc:codegen:pointer*))
+          (cons result-key arg-keys))))
+
+;; The user-overload name a math / comparison operator dispatches to when its
+;; operands are non-numeric --- the same names the old path rewrites the operator
+;; to (xtm_addition## etc.) before resolving the poly.
+(define xtc:infer:math-poly-name
+  (lambda (op)
+    (cond ((eq? op '+) "xtm_addition")
+          ((eq? op '-) "xtm_subtraction")
+          ((eq? op '*) "xtm_multiplication")
+          ((eq? op '/) "xtm_division")
+          ((eq? op '%) "xtm_modulo")
+          (else #f))))
+
+(define xtc:infer:compare-poly-name
+  (lambda (op)
+    (cond ((eq? op '<)  "xtm_lessthan")
+          ((eq? op '>)  "xtm_greaterthan")
+          ((eq? op '=)  "xtm_equal")
+          ((eq? op '<>) "xtm_notequal")
+          (else #f))))
+
+;; The candidate signatures (ret param ...) of a registered overload, or '() if
+;; none is registered (no library has defined one for these operands --- then the
+;; operator is purely numeric).  Each polyfunc candidate is a closure int-code
+;; (head ret p...); its cdr is the signature the overload constraint speaks.
+(define xtc:infer:poly-candidates
+  (lambda (name)
+    (if (and name (xtc:cache:polyfunc-exists? name))
+        (let ((cands (xtc:cache:get-polyfunc-candidate-types name)))
+          (if cands (map cdr cands) '()))
+        '())))
+
+;; The full candidate set for a math operator: one (w w w) numeric width per
+;; scalar type, then any user xtm_addition / ... overloads for tuple operands,
+;; then the structural SIMD-vector rule (see xtc:solve:vecmath-viable), which
+;; only an operand grounded to a vector can select.
+(define xtc:infer:math-candidates
+  (lambda (op)
+    (append (map (lambda (w) (list w w w)) (xtc:infer:numeric-class))
+            (xtc:infer:poly-candidates (xtc:infer:math-poly-name op))
+            (list 'vecmath))))
+
+;; The candidate set for a comparison: one (i1 w w) per numeric width --- the
+;; result is i1 however wide the operands --- then any user xtm_lessthan / ...
+;; overloads, which likewise return i1, then the structural pointer-comparison
+;; rule (two pointers of one type, selected only by a grounded pointer operand).
+(define xtc:infer:compare-candidates
+  (lambda (op)
+    (append (map (lambda (w) (list *xtc:codegen:i1* w w)) (xtc:infer:numeric-class))
+            (xtc:infer:poly-candidates (xtc:infer:compare-poly-name op))
+            (list 'ptrcmp))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; the traversal       ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A symbol in value position.  A local variable denotes its own type variable.
+;; Otherwise the symbol must name something already known --- a bound closure
+;; (its boxed-closure type), a global variable (its cell type, less the cell's
+;; own pointer), or a type-annotated generic / poly reference (the annotation
+;; IS its type) --- and contributes that known type directly, keyless.  Anything
+;; else is the same hard "cannot find symbol" the old checker raises: inference
+;; must not invent a type for an undeclared variable (a typo would otherwise
+;; surface only at codegen, or worse, compile wrongly).
+(define xtc:infer:collect-symbol
+  (lambda (ast bound)
+    (if (member ast bound)
+        (cons ast '())
+        (let* ((name (symbol->string ast))
+               (unmarked (car (string-split-on name "##"))))
+          (cond
+            ((xtc:cache:globalvar-exists? name)
+             (cons (xtc:codegen:strip-ptr-depth (xtc:cache:get-globalvar-type name))
+                   '()))
+            ((xtc:cache:nativefunc-exists? name)
+             (cons (xtc:cache:get-nativefunc-type name) '()))
+            ((xtc:cache:closure-exists? name)
+             (cons (cons (+ *xtc:codegen:closure* (* 2 *xtc:codegen:pointer*))
+                         (map xtc:codegen:get-type-from-str
+                              (xtc:cache:get-closure-arg-types name)))
+                   '()))
+            ;; a type-annotated generic / poly reference (name:type): the
+            ;; annotation IS its type
+            ((string-contains? unmarked ":")
+             (let ((p (regex:type-split unmarked ":")))
+               (if (or (xtc:cache:genericfunc-exists? (string->symbol (car p)))
+                       (xtc:cache:polyfunc-exists? (car p)))
+                   (cons (xtc:codegen:get-type-from-pretty-str
+                           (if (xtc:cache:typealias-exists? (cadr p))
+                               (xtc:codegen:pretty-print-type
+                                 (xtc:cache:get-typealias-type (cadr p)))
+                               (cadr p)))
+                         '())
+                   (xtc:diagnostics:print-missing-identifier-error ast 'symbol))))
+            ;; a poly reference, bare or ##-marked (a closure passed as an
+            ;; argument, stored in a binding...): its type is one of the poly's
+            ;; candidate closure types --- the standard overload, with a result /
+            ;; parameter key synthesised per slot and the site symbol tied to
+            ;; the assembled closure, so the context it flows into (the
+            ;; receiving parameter's type) picks the candidate.
+            ((xtc:cache:polyfunc-exists? unmarked)
+             (let ((cands (xtc:infer:poly-candidates unmarked)))
+               (if (not (= 1 (length (cl:remove-duplicates (map length cands)))))
+                   (xtc:diagnostics:print-compiler-error
+                     "Try forcing a type? Ambiguous polymorphic function as a value" ast)
+                   (let ((rk (xtc:infer:fresh-key))
+                         (aks (map (lambda (_) (xtc:infer:fresh-key))
+                                   (cdr (car cands)))))
+                     (cons ast
+                           (list (xtc:solve:c-eq ast (xtc:infer:closure-code rk aks))
+                                 (xtc:solve:c-overload rk aks cands)))))))
+            ((xtc:cache:genericfunc-exists? (string->symbol unmarked))
+             (xtc:diagnostics:print-compiler-error
+               "Try forcing a type? Ambiguous generic function as value" ast))
+            (else
+              (xtc:diagnostics:print-missing-identifier-error ast 'symbol)))))))
+
+;; Collect constraints for one (already desugared) AST node, given the set of
+;; lexically in-scope local variables.  Returns (cons result-key constraints).
+(define xtc:infer:collect
+  (lambda (ast bound)
+    (cond
+      ;; an empty form (e.g. a bind-type generator splicing nothing for a
+      ;; scalar field) contributes nothing, like the old checker's '() case
+      ((null? ast) (cons *xtc:codegen:void* '()))
+      ;; integer literal: a fresh variable defaulting to the integer class
+      ((and (number? ast) (integer? ast))
+       (let ((k (xtc:infer:fresh-key)))
+         (cons k (list (xtc:solve:c-default k (xtc:infer:int-class ast))))))
+      ;; floating-point literal: defaults to the float class
+      ((number? ast)
+       (let ((k (xtc:infer:fresh-key)))
+         (cons k (list (xtc:solve:c-default k (xtc:infer:float-class))))))
+      ;; a string literal is an i8* (a pointer to its bytes)
+      ((string? ast) (cons (+ *xtc:codegen:pointer* *xtc:codegen:si8*) '()))
+      ;; a symbol: a local variable's type variable, or a known global's type
+      ((symbol? ast) (xtc:infer:collect-symbol ast bound))
+      ;; desugared boolean literals are i1
+      ((and (pair? ast) (eq? (car ast) 'impc_true))  (cons *xtc:codegen:i1* '()))
+      ((and (pair? ast) (eq? (car ast) 'impc_false)) (cons *xtc:codegen:i1* '()))
+      ((ast:let? ast)    (xtc:infer:collect-let ast bound))
+      ((ast:lambda? ast) (xtc:infer:collect-lambda ast bound))
+      ((ast:begin? ast)  (xtc:infer:collect-seq (cdr ast) bound))
+      ((ast:if? ast)     (xtc:infer:collect-if ast bound))
+      ;; (ret-> fn expr): a return marker mark-returns inserts.  The marked expr
+      ;; IS the value flowing to the function's return, and collect-lambda already
+      ;; ties a lambda's return to its body's result, so the marker is transparent
+      ;; to inference --- its type is the expr's.  (The old ret-check additionally
+      ;; uses the function's known return type to direct the expr; the solver
+      ;; propagates that relationship either way, so no direction is needed here.)
+      ((and (pair? ast) (eq? (car ast) 'ret->))
+       (xtc:infer:collect (caddr ast) bound))
+      ((and (pair? ast) (symbol? (car ast)) (xtc:infer:math-op? (car ast)))
+       (xtc:infer:collect-math ast bound))
+      ((and (pair? ast) (symbol? (car ast)) (xtc:infer:compare-op? (car ast)))
+       (xtc:infer:collect-compare ast bound))
+      ;; memory / aggregate forms
+      ((and (pair? ast) (eq? (car ast) 'void))      (cons *xtc:codegen:void* '()))
+      ((and (pair? ast) (eq? (car ast) 'null?))     (xtc:infer:collect-null? ast bound))
+      ((and (pair? ast) (eq? (car ast) 'impc_null)) (cons (xtc:infer:fresh-key) '()))
+      ((ast:set!? ast)                              (xtc:infer:collect-set! ast bound))
+      ((and (pair? ast) (member (car ast) '(stack-alloc heap-alloc zone-alloc)))
+       (xtc:infer:collect-alloc ast bound))
+      ((and (pair? ast) (eq? (car ast) 'ref))       (xtc:infer:collect-ref ast bound))
+      ((and (pair? ast) (eq? (car ast) 'pref))      (xtc:infer:collect-pref ast bound))
+      ((and (pair? ast) (member (car ast) '(pointer-ref pdref)))
+       (xtc:infer:collect-deref ast bound))
+      ((and (pair? ast) (eq? (car ast) 'pointer-ref-ptr))
+       (xtc:infer:collect-pointer-ref-ptr ast bound))
+      ((and (pair? ast) (eq? (car ast) 'pointer-set!))
+       (xtc:infer:collect-pointer-set! ast bound))
+      ((and (pair? ast) (member (car ast) '(tuple-ref array-ref vector-ref)))
+       (xtc:infer:collect-aggregate-ref ast bound))
+      ((and (pair? ast) (member (car ast) '(tuple-set! array-set! vector-set!)))
+       (xtc:infer:collect-aggregate-set! ast bound))
+      ((and (pair? ast) (member (car ast) '(tuple-ref-ptr array-ref-ptr)))
+       (xtc:infer:collect-aggregate-ref-ptr ast bound))
+      ((and (pair? ast) (eq? (car ast) 'make-tuple))
+       (xtc:infer:collect-make-tuple ast bound))
+      ((and (pair? ast) (eq? (car ast) 'make-array))
+       (xtc:infer:collect-make-homogeneous ast bound *xtc:codegen:array*))
+      ((and (pair? ast) (eq? (car ast) 'make-vector))
+       (xtc:infer:collect-make-homogeneous ast bound *xtc:codegen:vector*))
+      ((and (pair? ast) (eq? (car ast) 'vector-shuffle))
+       (xtc:infer:collect-vector-shuffle ast bound))
+      ((and (pair? ast) (eq? (car ast) 'closure-ref))
+       (xtc:infer:collect-closure-ref ast bound))
+      ((and (pair? ast) (eq? (car ast) 'closure-set!))
+       (xtc:infer:collect-closure-set! ast bound))
+      ((and (pair? ast) (eq? (car ast) 'closure-refcheck))
+       (cons *xtc:codegen:i1*
+             (cdr (xtc:infer:collect (cadr ast) bound))))
+      ((and (pair? ast) (member (car ast) '(push_zone pop_zone push_new_zone create_zone)))
+       (xtc:infer:collect-zone ast bound))
+      ((and (pair? ast) (member (car ast) '(num-of-elts obj-size)))
+       (xtc:infer:collect-size-query ast bound))
+      ((and (pair? ast) (eq? (car ast) 'while))     (xtc:infer:collect-while ast bound))
+      ((and (pair? ast) (eq? (car ast) 'dotimes))   (xtc:infer:collect-dotimes ast bound))
+      ((and (pair? ast) (member (car ast) '(bitcast bitconvert)))
+       (xtc:infer:collect-bitcast ast bound))
+      ((and (pair? ast) (member (car ast) '(printf sprintf fprintf sscanf fscanf)))
+       (xtc:infer:collect-printf ast bound))
+      ((and (pair? ast) (symbol? (car ast)) (xtc:infer:math-intrinsic? (car ast)))
+       (xtc:infer:collect-math-intrinsic ast bound))
+      ((and (pair? ast) (eq? (car ast) 'llvm_callback))
+       (xtc:infer:collect-callback ast bound))
+      ;; (fptrcall fp arg ...) is a call through a raw function pointer: fp is
+      ;; a closure whose slots take the args, exactly a computed-head call
+      ((and (pair? ast) (eq? (car ast) 'fptrcall))
+       (xtc:infer:collect-closure-call (cdr ast) bound))
+      ;; a local variable in call position is a closure call; so is an
+      ;; application whose head is itself an expression (a computed closure),
+      ;; and so is a GLOBAL VARIABLE of closure type (a bind-val'd closure)
+      ((and (pair? ast) (symbol? (car ast)) (member (car ast) bound))
+       (xtc:infer:collect-closure-call ast bound))
+      ((and (pair? ast) (pair? (car ast)))
+       (xtc:infer:collect-closure-call ast bound))
+      ((and (pair? ast) (symbol? (car ast))
+            (xtc:cache:globalvar-exists? (symbol->string (car ast)))
+            (xtc:codegen:closure? (xtc:codegen:strip-ptr-depth
+                                    (xtc:cache:get-globalvar-type (symbol->string (car ast))))))
+       (xtc:infer:collect-closure-call ast bound))
+      ;; otherwise a symbol in call position is a global function (its candidate
+      ;; signatures) or a generic function whose return reifies from the argument
+      ;; types by unification --- the same overload, only its candidates carry
+      ;; bang variables (and named generic types as nominal patterns).  An unknown
+      ;; symbol, or a generic kind not yet handled (a constraint-guarded or
+      ;; free-return specialisation), is a loud gap.
+      ((and (pair? ast) (symbol? (car ast)))
+       ;; a genericfunc carrying a free-return fallback (first/second's [!a,!b]*)
+       ;; is routed through collect-generic-call, which reifies the fallback by
+       ;; projection when no specialisation matches.  Otherwise a genericfunc is
+       ;; resolved through its generic signatures FIRST: it may also carry compiled
+       ;; monomorphic instances (a polyfunc), but those cover only the types
+       ;; already specialised, whereas the generic reifies any argument type --- so
+       ;; prefer it, falling back to the plain global path.
+       (if (xtc:infer:generic-fallback-entry (car ast) (length (cdr ast)))
+           (xtc:infer:collect-generic-call ast bound)
+           (let ((cands (or (xtc:infer:generic-candidates (car ast) (length (cdr ast)))
+                            (xtc:infer:global-candidates (car ast)))))
+             (cond (cands
+                     (xtc:infer:collect-global-call ast cands bound))
+                   ;; the symbol names a generic whose only specialisations are
+                   ;; a kind this path defers (constraint-guarded): a loud gap
+                   ((xtc:cache:genericfunc-exists?
+                      (string->symbol (xtc:codegen:get-base-type (symbol->string (car ast)))))
+                    (xtc:diagnostics:print-compiler-error
+                      (string-append "xtc:infer: deferred generic kind: "
+                                     (sexpr->string ast))))
+                   ;; parity with the old checker: an unknown call-position
+                   ;; symbol is an undefined function
+                   (else
+                     (xtc:diagnostics:print-missing-identifier-error (car ast) 'symbol))))))
+      (else
+        (xtc:diagnostics:print-compiler-error
+          (string-append "xtc:infer: unhandled form: "
+                         (sexpr->string ast)))))))
+
+;; A binding (v e) constrains v to e's type; the let's type is its body's.  The
+;; bound vars are in scope for the body and (let*-style, harmlessly wider than
+;; plain let) for the binding right-hand sides too.
+(define xtc:infer:collect-let
+  (lambda (ast bound)
+    (let* ((bindings (cadr ast))
+           (inner (append (map car bindings) bound)))
+      (let loop ((bs bindings) (cs '()))
+        (if (null? bs)
+            (let ((body (xtc:infer:collect-seq (cddr ast) inner)))
+              (cons (car body) (append cs (cdr body))))
+            (let* ((b (car bs))
+                   (v (car b))
+                   (rc (xtc:infer:collect (cadr b) inner)))
+              (loop (cdr bs)
+                    (append cs (cons (xtc:solve:c-eq v (car rc)) (cdr rc))))))))))
+
+;; (lambda (p ...) body): the parameters are local variables (their own type
+;; variables, shared by name with their uses in the body), the result is the
+;; body's, and the lambda's type is the closure assembled from them.  Because
+;; the parameter slots and the body's uses intern to the same variables, a use
+;; that pins a parameter's type pins the corresponding argument slot too.
+;; The return is tied to the body through a tiny overload rather than a bare
+;; equality: either the two are the same type (the inference case, tried
+;; first), or the return is VOID and the body's tail value is discarded ---
+;; the old checker lets a [void,...]* function end in any expression
+;; ((lambda (p v) (pset! p 0 v)) under a void signature).
+(define xtc:infer:collect-lambda
+  (lambda (ast bound)
+    (let* ((params (ast:lambda-params ast))
+           (body (xtc:infer:collect (ast:lambda-body ast) (append params bound)))
+           (rk (xtc:infer:fresh-key)))
+      (cons (xtc:infer:closure-code rk params)
+            (cons (xtc:solve:c-overload rk (list (car body))
+                                        (list '(!gxret !gxret)
+                                              (list *xtc:codegen:void* '!gxret)))
+                  (cdr body))))))
+
+;; (f arg ...) with f a local closure --- or ((f-expr) arg ...) with a computed
+;; head, e.g. ((pref closure-buf i) x y): the head must be a closure whose
+;; argument slots are the argument types and whose result is fresh; the call's
+;; type is that result.  Unifying the head against this synthesised closure is
+;; the instantiate-and-unify step --- the call site's argument types flow into
+;; its signature and its return type flows back out, in one equality.  The head
+;; is collected like any expression (a bound symbol denotes its own variable).
+(define xtc:infer:collect-closure-call
+  (lambda (ast bound)
+    (let* ((rc-f (xtc:infer:collect (car ast) bound))
+           (args (map (lambda (a) (xtc:infer:collect a bound)) (cdr ast)))
+           (rk (xtc:infer:fresh-key)))
+      (cons rk
+            (append (cdr rc-f)
+                    (apply append (map cdr args))
+                    ;; a ZERO-argument application of a local cannot assert a
+                    ;; closure type: the old checker reads (v) over a
+                    ;; non-closure v as v itself ((if (FM) ...) over an i1 ---
+                    ;; dlogue relies on it), so which reading applies is
+                    ;; deferred until the head's type grounds
+                    (if (and (null? (cdr ast)) (symbol? (car ast)))
+                        (list (xtc:solve:c-callval rk (car rc-f)))
+                        (list (xtc:solve:c-eq (car rc-f)
+                                              (xtc:infer:closure-code rk (map car args))))))))))
+
+;; The candidate signatures of a global function named `sym', each the int-code
+;; list (return-type param-type ...), or #f if `sym' is not a global function
+;; whose signatures are known here (it is unknown, or a generic --- both
+;; deferred).  A bind-lib native and a bound closure each contribute their one
+;; signature; a bind-func is registered as a polyfunc, so its candidate list ---
+;; one entry when monomorphic, several when overloaded --- supplies the rest.
+;; The sources are UNIONED, not chosen between: a name can be a native AND
+;; carry poly overloads (tan: the libc double native plus a float overload),
+;; and dropping the poly's float candidate forces a float operand to double.
+;; The native leads so an unconstrained tie still breaks its way.
+(define xtc:infer:global-candidates
+  (lambda (sym)
+    (let* ((name (symbol->string sym))
+           (native (if (xtc:cache:nativefunc-exists? name)
+                       (list (map xtc:codegen:get-type-from-str
+                                  (xtc:cache:get-nativefunc-arg-types name)))
+                       '()))
+           (closure (if (xtc:cache:closure-exists? name)
+                        (list (map xtc:codegen:get-type-from-str
+                                   (xtc:cache:get-closure-arg-types name)))
+                        '()))
+           (base (xtc:codegen:get-base-type name))
+           (poly (if (xtc:cache:polyfunc-exists? base)
+                     (let ((candidates (xtc:cache:get-polyfunc-candidate-types base)))
+                       ;; a candidate is the closure (head ret p...); its cdr is
+                       ;; the (ret p...) signature the overload constraint speaks
+                       (if candidates (map cdr candidates) '()))
+                     '()))
+           (all (cl:remove-duplicates (append native closure poly))))
+      (and (not (null? all)) all))))
+
+;; The bang (type) variables of an int-code type, each canonicalised (trailing
+;; pointer stars and any ## suffix dropped) so !a, !a* and !a##3 count as one.
+;; A generic-instance component rides as a pretty string (e.g. "List{!a}*"); its
+;; variables are the bang tokens it contains.
+(define xtc:infer:bang-canon
+  (lambda (s) (xtc:type:strip-trailing-stars (car (string-split-on s "##")))))
+
+(define xtc:infer:bang-vars
+  (lambda (ic)
+    (cond ((symbol? ic)
+           (let ((s (symbol->string ic)))
+             (if (and (> (string-length s) 0) (char=? (string-ref s 0) #\!))
+                 (list (xtc:infer:bang-canon s))
+                 '())))
+          ((string? ic)
+           (map xtc:infer:bang-canon (regex:match-all ic "![a-zA-Z0-9_]*")))
+          ((pair? ic) (apply append (map xtc:infer:bang-vars ic)))
+          (else '()))))
+
+;; Can a candidate signature (ret param ...) reify its return by unification?
+;; Only if every variable in the return type is bound by some parameter; a
+;; signature whose return is free (e.g. first's fallback [!a,!b]*, !a nowhere in
+;; the args) needs expected-type direction or body reification and is deferred.
+(define xtc:infer:sig-reifiable?
+  (lambda (sig)
+    (let ((param-bangs (xtc:infer:bang-vars (cdr sig))))
+      (cl:every (lambda (b) (and (member b param-bangs) #t))
+                (xtc:infer:bang-vars (car sig))))))
+
+;; The (ret param ...) signature of a generic specialisation, read from its
+;; pretty closure type.  A named generic-type component (List{!a}, Pair{!a,!b})
+;; is KEPT as its pretty string so the int-code bridge decodes it to a nominal
+;; napp term --- not expanded to a structural tuple, which would lose the name
+;; and let distinct same-shaped generics (List vs Pair) cross-unify.  The
+;; registration sometimes leaves an instance in its ANNOTATED-EXPANSION
+;; spelling instead (NUM:<[!a,!a,!a]*,...>*); that is the same nominal type, so
+;; it is reconstructed as Name{vars} from the expansion's type variables
+;; (first-seen order, the declaration's order) at the component's pointer
+;; depth.  Every other component is parsed to an int-code as usual.
+;; Rewrite every annotated-expansion substring Name:<...> --- the spelling
+;; registration leaves for a nominal instance, including NESTED inside a
+;; closure or tuple component (bind's [Maybe:<i1,!b>*,!a]* parameter) --- to
+;; the nominal pattern Name{bangs}, the bangs read TEXTUALLY from the
+;; expansion (parsing it would drag in the extra variables a recursive type's
+;; bare self-reference expands to).  Bracket-matched by hand; restarts after
+;; each splice so nested occurrences all normalise.
+(define xtc:infer:nominalise-annotations
+  (lambda (s)
+    (let scan ((i 0))
+      (cond
+        ((>= i (- (string-length s) 1)) s)
+        ((and (char=? (string-ref s i) #\:)
+              (char=? (string-ref s (+ i 1)) #\<))
+         (let back ((j (- i 1)))
+           (if (and (>= j 0)
+                    (let ((ch (string-ref s j)))
+                      (or (char-alphabetic? ch) (char-numeric? ch)
+                          (char=? ch #\_) (char=? ch #\-))))
+               (back (- j 1))
+               (let ((name (substring s (+ j 1) i)))
+                 (if (and (> (string-length name) 0)
+                          (xtc:cache:generictype-exists? name))
+                     (let fwd ((k (+ i 2)) (depth 1))
+                       (cond
+                         ((>= k (string-length s)) s)
+                         ((char=? (string-ref s k) #\<) (fwd (+ k 1) (+ depth 1)))
+                         ((char=? (string-ref s k) #\>)
+                          (if (= depth 1)
+                              (let* ((inner (substring s (+ i 2) k))
+                                     (params (cl:remove-duplicates
+                                               (map xtc:infer:bang-canon
+                                                    (regex:match-all inner "![a-zA-Z0-9_]*")))))
+                                (xtc:infer:nominalise-annotations
+                                  (string-append
+                                    (substring s 0 (+ j 1))
+                                    name "{" (string-join params ",") "}"
+                                    (substring s (+ k 1) (string-length s)))))
+                              (fwd (+ k 1) (- depth 1))))
+                         (else (fwd (+ k 1) depth))))
+                     (scan (+ i 1)))))))
+        (else (scan (+ i 1)))))))
+
+;; One signature component to its candidate int-code, keeping every nominal
+;; instance nominal.  A closure or tuple component CONTAINING braced instances
+;; recurses per sub-component (the old parser would expand the inner instance
+;; structurally); a braced pattern rides as a string for the bridge, with any
+;; recursive self-name leaked as a spurious extra argument (Tree{!a,Tree} for
+;; the 1-parameter Tree) dropped so the pattern's arity matches the instances';
+;; a BARE registered generic name (a recursive type's self-reference, Blob's
+;; Shape*) rides as the named term, compatible with any instance of the name.
+;; Does a compound component spell a nominal type somewhere inside --- a
+;; braced instance, or a registered generic's bare name (the [Stream*]* field
+;; of Stream <!a,[Stream*]*>)?  Such a component is decoded per sub-component
+;; so the name stays nominal; parsed whole, the surface parser would expand the
+;; bare name structurally into a tuple that no instance unifies with.
+(define xtc:infer:nominal-inside?
+  (lambda (s)
+    (or (string-contains? s "{")
+        (and (cl:find-if xtc:cache:generictype-exists?
+                         (regex:match-all s "[A-Za-z_][A-Za-z0-9_-]*"))
+             #t))))
+
+(define xtc:infer:component->candidate
+  (lambda (c0)
+    (let* ((c (xtc:infer:nominalise-annotations c0))
+           (base (xtc:type:strip-trailing-stars c))
+           (depth (- (string-length c) (string-length base))))
+      (cond
+        ((and (> (string-length base) 0)
+              (char=? (string-ref base 0) #\[)
+              (xtc:infer:nominal-inside? base))
+         (cons (+ *xtc:codegen:closure* (* (+ depth 1) *xtc:codegen:pointer*))
+               (map xtc:infer:component->candidate
+                    (xtc:codegen:get-pretty-closure-arg-strings base))))
+        ((and (> (string-length base) 0)
+              (char=? (string-ref base 0) #\<)
+              (xtc:infer:nominal-inside? base))
+         (cons (+ *xtc:codegen:tuple* (* depth *xtc:codegen:pointer*))
+               (map xtc:infer:component->candidate
+                    (xtc:codegen:get-pretty-tuple-arg-strings base))))
+        ((string-contains? c "{")
+         (let ((name (car (string-split-on c "{"))))
+           (if (and (xtc:cache:generictype-exists? name)
+                    (char=? (string-ref base (- (string-length base) 1)) #\}))
+               (let* ((inner (substring base (+ 1 (string-length name))
+                                        (- (string-length base) 1)))
+                      (args (cl:remove-if
+                              (lambda (a) (string=? (xtc:type:strip-trailing-stars a) name))
+                              (xtc:codegen:get-pretty-tuple-arg-strings
+                                (string-append "<" inner ">")))))
+                 (string-append name "{" (string-join args ",") "}"
+                                (make-string depth #\*)))
+               c)))
+        ((xtc:cache:generictype-exists? base)
+         (string-append "%" c))
+        (else (xtc:codegen:get-type-from-pretty-str c))))))
+
+;; Memoised: the same registered signature strings decode at every call site
+;; of every function compile, and the decode (string scans, registry lookups,
+;; the surface parser) is pure in its input string --- a generic type used in a
+;; signature is always registered before any code can spell the signature.
+(define *xtc:infer:sig-cache* (make-hashtable 512))
+
+(define xtc:infer:pretty-sig->candidate
+  (lambda (pretty)
+    (or (hashtable-ref *xtc:infer:sig-cache* pretty)
+        (let ((sig (map xtc:infer:component->candidate
+                        (xtc:codegen:get-pretty-closure-arg-strings pretty))))
+          (hashtable-set! *xtc:infer:sig-cache* pretty sig)
+          sig))))
+
+;; The candidate signatures of a generic function named `sym' at the given
+;; arity, or #f if none applies here.  A genericfunc's return type is reified
+;; from its arguments: the solver freshens each candidate's variables and
+;; unifies them with the arguments, so a signature like (!a !a), (!a !a*), or
+;; (!a "List{!a}*") carries the return type back out.  A named generic type
+;; argument unifies NOMINALLY (List{i64} is napp "List" i64, distinct from a
+;; same-shaped Pair) --- see the bridge.
+;;
+;; Restricted to the unconstrained, return-reifiable specialisations: a
+;; constraint-guarded one (the cache's predicate field) and a free return (see
+;; sig-reifiable?) are deferred --- a loud gap, kept out of the corpus.
+(define xtc:infer:generic-candidates
+  (lambda (sym arity)
+    (let* ((base (xtc:codegen:get-base-type (symbol->string sym)))
+           (entries (hashtable-ref *xtc:cache:genericfunc-cache* base)))
+      (and entries
+           (let ((sigs (cl:remove
+                         #f
+                         (map (lambda (e)
+                                (and (= (cadr e) arity)
+                                     (not (list-ref e 5))
+                                     (let ((sig (xtc:infer:pretty-sig->candidate
+                                                  (symbol->string (caddr e)))))
+                                       (and (xtc:infer:sig-reifiable? sig) sig))))
+                              entries))))
+             (and (not (null? sigs)) sigs))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; free-return generics ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; A genericfunc may carry a fully-general FALLBACK specialisation whose return
+;; is free --- first/second's [!a,!b]*, body (tref a i) --- which the reifiable
+;; overload (generic-candidates) deliberately filters out, because the signature
+;; alone cannot reify its return (the return variable is bound nowhere in the
+;; parameters).  The old path handles such a call by "exercising the generic
+;; code": it type-checks the body with the parameters pinned to the concrete
+;; argument types, reading the return off the result.  We do the same, but
+;; structurally: when no reifiable specialisation matches the (resolved) argument
+;; types, we reify the fallback by PROJECTING its body's field access against the
+;; concrete argument --- field i of the argument tuple, exactly what (tref a i)
+;; computes.  The argument types are obtained by a local solve of the argument
+;; sub-expressions; a non-ground argument (one referring to an outer variable not
+;; bound here) leaves the body unexercisable, so it is deferred to the lazy
+;; overload (where an expected return type can direct it).
+
+;; All unconstrained generic entries for `sym' at `arity', each as (sig . body)
+;; --- the candidate signature paired with its raw source lambda (lambda (p...)
+;; expr), which projection reads to learn which field the fallback returns.
+(define xtc:infer:generic-entries
+  (lambda (sym arity)
+    (let* ((base (xtc:codegen:get-base-type (symbol->string sym)))
+           (entries (hashtable-ref *xtc:cache:genericfunc-cache* base)))
+      (and entries
+           (cl:remove
+             #f
+             (map (lambda (e)
+                    (and (= (cadr e) arity)
+                         (not (list-ref e 5))
+                         (cons (xtc:infer:pretty-sig->candidate
+                                 (symbol->string (caddr e)))
+                               (caddr (cadddr e)))))
+                  entries))))))
+
+;; The free-return fallback entry (sig . body) for `sym' at `arity' --- one
+;; whose signature is not return-reifiable (see sig-reifiable?) --- or #f.
+;; Given concrete argument terms, the fallback that ACCEPTS them: the
+;; expression problem registers one eval fallback per node type, and only
+;; the Add one describes an Add.  Without arguments, the first registered.
+(define xtc:infer:generic-fallback-entry
+  (lambda (sym arity . argterms)
+    (let* ((es (xtc:infer:generic-entries sym arity))
+           (fbs (if es
+                    (cl:remove-if (lambda (e) (xtc:infer:sig-reifiable? (car e))) es)
+                    '())))
+      (and (pair? fbs)
+           (if (null? argterms)
+               (car fbs)
+               (cl:find-if (lambda (e) (xtc:infer:spec-matches? (car e) (car argterms)))
+                           fbs))))))
+
+;; Solve a sub-expression's constraints in isolation and return its resolved
+;; canonical TERM, or #f if it does not fully determine (a conflict, or a residual
+;; variable --- e.g. the sub-expression refers to an outer program variable).
+(define xtc:infer:resolve-subterm
+  (lambda (key constraints)
+    (let* ((intern (make-hashtable))
+           (subst (xtc:solve:run constraints intern)))
+      (if (eq? subst 'conflict)
+          #f
+          (let ((term (xtc:type:apply-subst
+                        (xtc:type:from-intcode key intern) subst)))
+            (if (pair? (xtc:type:free-vars term)) #f term))))))
+
+;; Does candidate signature `sig' (ret p...) accept the concrete argument terms?
+;; Its parameters are freshened through a per-signature intern so its bang
+;; variables instantiate independently, then unified with the arguments.
+(define xtc:infer:spec-matches?
+  (lambda (sig argterms)
+    (let ((fresh (make-hashtable)))
+      (let loop ((ps (cdr sig)) (as argterms) (s xtc:type:empty-subst))
+        (cond ((null? ps) (null? as))
+              ((null? as) #f)
+              (else
+                (let ((s2 (xtc:type:unify (xtc:type:from-intcode (car ps) fresh)
+                                          (car as) s)))
+                  (and s2 (loop (cdr ps) (cdr as) s2)))))))))
+
+(define xtc:infer:any-spec-matches?
+  (lambda (specs argterms)
+    (and (cl:find-if (lambda (sig) (xtc:infer:spec-matches? sig argterms)) specs) #t)))
+
+;; A lambda parameter's name, dropping any :type annotation.
+(define xtc:infer:param-name
+  (lambda (p)
+    (string->symbol (car (string-split-on (symbol->string p) ":")))))
+
+(define xtc:infer:index-of
+  (lambda (x xs)
+    (let loop ((xs xs) (i 0))
+      (cond ((null? xs) #f)
+            ((eq? (car xs) x) i)
+            (else (loop (cdr xs) (+ i 1)))))))
+
+;; The projection recipe (param-position . field-index) a fallback body
+;; describes.  The real fallbacks are field accessors --- (lambda (p...)
+;; (tref pj i)) --- so the return is field i of the tuple argument bound to
+;; pj.  A body of any other shape is not yet handled (a loud gap, #f).
+(define xtc:infer:fallback-recipe
+  (lambda (body)
+    (and (pair? body) (eq? (car body) 'lambda)
+         (let ((params (map xtc:infer:param-name (cadr body)))
+               (expr (caddr body)))
+           (and (pair? expr) (member (car expr) '(tref tuple-ref))
+                (integer? (caddr expr))
+                (let ((pos (xtc:infer:index-of (xtc:infer:param-name (cadr expr)) params)))
+                  (and pos (cons pos (caddr expr)))))))))
+
+;; Reify a free-return fallback by exercising its body against the concrete
+;; argument terms: project the recipe's field (through the shared bridge
+;; engine) directly.
+(define xtc:infer:project-fallback
+  (lambda (body argterms)
+    (let ((recipe (xtc:infer:fallback-recipe body)))
+      (and recipe
+           (let ((field (xtc:type:project-field-term
+                          (list-ref argterms (car recipe)) (cdr recipe))))
+             (and field
+                  (null? (xtc:type:free-vars field))
+                  (xtc:type:to-intcode field)))))))
+
+;; Reify a free-return generic call whose arguments have grounded: the fallback
+;; that accepts them is projected when its body is a field accessor, and
+;; otherwise EXERCISED --- its body inferred with the parameters pinned to the
+;; argument types, the return read off the result.  This is the old checker's
+;; "exercise the generic code", for the bodies a projection recipe cannot
+;; describe (eval:[!a,Add*]* summing two recursive evals).  The return's
+;; int-code, or #f when nothing can be learned.  Called eagerly at collect
+;; time when the arguments are already ground, and from the solver (through
+;; *xtc:solve:exercise-hook*) when they ground during the solve.
+(define xtc:infer:exercise-generic
+  (lambda (sym arity argterms)
+    (let ((fb (xtc:infer:generic-fallback-entry sym arity argterms)))
+      (and fb
+           (or (xtc:infer:project-fallback (cdr fb) argterms)
+               (xtc:infer:exercise-body sym (cdr fb) argterms))))))
+
+;; The exercises in progress, keyed "sym:argtypes".  Re-entry on the same key
+;; is a self-recursive generic (sum over a Node{i64} summing its Node{i64}
+;; tail), whose return the enclosing exercise --- or the instance compile
+;; itself, through its other uses --- determines; the nested call learns
+;; nothing and says so with #f.
+(define *xtc:infer:exercise-stack* '())
+;; Memoised by the same key for the duration of one top-level check-function
+;; (the search revisits a call on every backtrack); a fresh table per compile,
+;; so a redefined fallback is exercised afresh.
+(define *xtc:infer:exercise-cache* (make-hashtable 16))
+;; Set while a body is exercised: a conflict inside is a negative result, not
+;; a diagnostic, so check-function's reporting is held back.
+(define *xtc:infer:exercising* #f)
+(define *xtc:infer:exercise-counter* 0)
+
+;; Infer the fallback's lambda with its parameters annotated as the argument
+;; types --- the driver's phases up to the type check, as inferfn's harness
+;; runs them --- and read the return off the lambda's closure type.  The
+;; pipeline state a nested run would clobber is rebound around it, and any
+;; error inside (a body the exercise cannot type) is the answer #f.
+(define xtc:infer:exercise-body
+  (lambda (sym body argterms)
+    (let* ((pretty (map (lambda (t) (xtc:type:to-pretty t (make-hashtable))) argterms))
+           (key (string-append (symbol->string sym) ":" (string-join pretty ","))))
+      (cond
+        ((hashtable-ref *xtc:infer:exercise-cache* key))
+        ((member key *xtc:infer:exercise-stack*) #f)
+        (else
+          (set! *xtc:infer:exercise-counter* (+ 1 *xtc:infer:exercise-counter*))
+          (let* ((symname (string->symbol
+                            (string-append "xtc_exercise_"
+                                           (number->string *xtc:infer:exercise-counter*))))
+                 (code (cons 'lambda
+                             (cons (map (lambda (p t)
+                                          (string->symbol
+                                            (string-append
+                                              (symbol->string (xtc:infer:param-name p))
+                                              ":" t)))
+                                        (cadr body) pretty)
+                                   (cddr body))))
+                 (ret (let-temporarily
+                        ((*xtc:infer:exercise-stack* (cons key *xtc:infer:exercise-stack*))
+                         (*xtc:infer:exercising* #t)
+                         (*xtc:solve:conflict-why* #f)
+                         (*xtc:globals:bound-lambdas* *xtc:globals:bound-lambdas*)
+                         (*xtc:codegen:sym-name-stack* *xtc:codegen:sym-name-stack*)
+                         (*xtc:codegen:ls_var* *xtc:codegen:ls_var*))
+                        (catch #f
+                          (let* ((syn (xtc:driver:syntactic-phase symname code))
+                                 (t1 (car syn))
+                                 (ann (xtc:driver:annotation-phase t1 symname))
+                                 (vars (cadr ann))
+                                 (forced (apply xtc:typecheck:handle-forced-types t1 (cadr syn)))
+                                 (t4 (xtc:typecheck:coercion-run (car ann) forced)))
+                            (if (not (hashtable-ref vars symname))
+                                (hashtable-set! vars symname (xtc:typecheck:make-uf-cell '())))
+                            (let* ((alist (xtc:infer:check-function vars forced t4))
+                                   ;; the lambda reads back under the name the
+                                   ;; syntactic phase let-bound it to (the outer
+                                   ;; let's first binding), as the closure
+                                   ;; int-code (head ret param...)
+                                   (bound (and (pair? t1) (eq? (car t1) 'let)
+                                               (pair? (cadr t1)) (caar (cadr t1))))
+                                   (entry (and alist bound (assoc bound alist))))
+                              (and entry (pair? (cdr entry)) (pair? (cddr entry))
+                                   (caddr entry))))))))
+            (if ret (hashtable-set! *xtc:infer:exercise-cache* key ret))
+            ret))))))
+
+;; (g arg ...) with g a genericfunc carrying a free-return fallback.  We collect
+;; the arguments, resolve them to concrete types, and either route to the lazy
+;; reifiable overload (a specialisation matches, or an argument is non-ground) ---
+;; the fallback never shadows a matching specialisation --- or, when only the
+;; fallback applies, reify it against the arguments (projecting or exercising
+;; its body) and pin the call's result to that concrete type.
+(define xtc:infer:collect-generic-call
+  (lambda (ast bound)
+    (let* ((sym (car ast))
+           (arity (length (cdr ast)))
+           (rcs (map (lambda (a) (xtc:infer:collect a bound)) (cdr ast)))
+           (argcons (apply append (map cdr rcs)))
+           (argterms (map (lambda (rc) (xtc:infer:resolve-subterm (car rc) (cdr rc))) rcs))
+           (specs (xtc:infer:generic-candidates sym arity)))
+      (cond
+        ((and specs (not (member #f argterms))
+              (xtc:infer:any-spec-matches? specs argterms))
+         ;; a return-reifiable specialisation matches the (ground) arguments:
+         ;; the ordinary overload carries the return out
+         (let ((rk (xtc:infer:fresh-key)))
+           (cons rk (append argcons
+                            (xtc:infer:site-constraint sym rk (map car rcs))
+                            (list (xtc:solve:c-overload rk (map car rcs) specs))))))
+        ((and (not (member #f argterms))
+              (let ((ic (xtc:infer:exercise-generic sym arity argterms)))
+                (and ic
+                     (let ((rk (xtc:infer:fresh-key)))
+                       (cons rk (append argcons
+                                        (xtc:infer:site-constraint sym rk (map car rcs))
+                                        (list (xtc:solve:c-eq rk ic)))))))))
+        (else
+          ;; no specialisation matches by arguments alone (an argument is not
+          ;; ground at collect time, or the eager reification could not fire):
+          ;; the call's CONTEXT directs the return --- the result key, tied by
+          ;; the surrounding binding or use, unifies with the signature's
+          ;; (napp-patterned) return and carries the type variables back into
+          ;; the parameter slots, the same way the old checker's expected type
+          ;; directed a free-return generic.  The fallback rides along as a
+          ;; DEFERRED exercise constraint: when the arguments ground during the
+          ;; solve, the result pins to what the accepting fallback's body
+          ;; projects or returns --- without it the fallback's free return
+          ;; satisfies any candidate the surrounding overload greedily picks,
+          ;; and the residual variable silently drops the site from the
+          ;; read-back (the recursive-ADT print instance: (print##
+          ;; (tree_value## t)) chose [void,Tree*]).
+          (let* ((sigs (map car (or (xtc:infer:generic-entries sym arity) '())))
+                 (rk (xtc:infer:fresh-key))
+                 (proj (if (xtc:infer:generic-fallback-entry sym arity)
+                           (list (xtc:solve:c-exercise rk sym arity (map car rcs)))
+                           '())))
+            (if (null? sigs)
+                (xtc:diagnostics:print-compiler-error
+                  (string-append "xtc:infer: no unconstrained specialisation --- deferred: "
+                                 (sexpr->string ast)))
+                (cons rk (append argcons
+                                 (xtc:infer:site-constraint sym rk (map car rcs))
+                                 (list (xtc:solve:c-overload rk (map car rcs) sigs))
+                                 proj)))))))))
+
+;; A ##-marked call-site symbol (the dispatch marker desugaring stamps on a
+;; poly / generic callee) is a variable in its own right: the old checker
+;; resolves it to the chosen signature's full closure type, and
+;; add-types-to-source reads that alist entry to pick (or compile) the concrete
+;; instance the call dispatches to.  Tie the site symbol to the call's
+;; assembled closure type so the entry comes out of the solve with it.
+;; The ## call-site symbols this check-function run constrained: the read-back
+;; must include them even when find-all-vars did not table them (it skips a
+;; generic callee whose arity check it cannot match), because
+;; add-types-to-source resolves every ## site through its alist entry.
+(define *xtc:infer:call-sites* '())
+
+(define xtc:infer:site-constraint
+  (lambda (sym result-key arg-keys)
+    (if (string-contains? (symbol->string sym) "##")
+        (begin
+          (set! *xtc:infer:call-sites* (cons sym *xtc:infer:call-sites*))
+          (list (xtc:solve:c-eq sym (xtc:infer:closure-code result-key arg-keys))))
+        '())))
+
+;; (f arg ...) with f a global function: the call's type is a fresh result that,
+;; with the argument types, must match exactly one of f's candidate signatures.
+;; A monomorphic callee has a single candidate, so the overload resolves to it
+;; at once; an overloaded callee is resolved by the arguments (the solver's
+;; deferred choice).  Routing the monomorphic case through the same overload ---
+;; rather than a bare equality --- is deliberate: the overload's class check
+;; keeps an integer literal from binding to a floating-point parameter.
+(define xtc:infer:collect-global-call
+  (lambda (ast cands bound)
+    (let* ((args (map (lambda (a) (xtc:infer:collect a bound)) (cdr ast)))
+           (rk (xtc:infer:fresh-key)))
+      (cons rk
+            (append (apply append (map cdr args))
+                    (xtc:infer:site-constraint (car ast) rk (map car args))
+                    (list (xtc:solve:c-overload rk (map car args) cands)))))))
+
+;; A sequence's type is its last expression's; the earlier expressions still
+;; contribute their own constraints (so their literals default, etc.).
+(define xtc:infer:collect-seq
+  (lambda (exprs bound)
+    (if (null? exprs)
+        (cons *xtc:codegen:void* '())
+        (let loop ((es exprs) (cs '()))
+          (let ((rc (xtc:infer:collect (car es) bound)))
+            (if (null? (cdr es))
+                (cons (car rc) (append cs (cdr rc)))
+                (loop (cdr es) (append cs (cdr rc)))))))))
+
+;; (if c t e): the condition is i1, the two branches unify, the result is the
+;; branch type.  A one-armed (if c t) runs t for effect; like the old check its
+;; type is t's, with no else to unify against.
+(define xtc:infer:collect-if
+  (lambda (ast bound)
+    (let* ((rc-c (xtc:infer:collect (cadr ast) bound))
+           (rc-t (xtc:infer:collect (caddr ast) bound))
+           (cond-c (xtc:solve:c-eq (car rc-c) *xtc:codegen:i1*)))
+      (if (null? (cdddr ast))
+          (cons (car rc-t)
+                (append (cdr rc-c) (cdr rc-t) (list cond-c)))
+          (let ((rc-e (xtc:infer:collect (cadddr ast) bound)))
+            (cons (car rc-t)
+                  (append (cdr rc-c) (cdr rc-t) (cdr rc-e)
+                          (list cond-c
+                                (xtc:solve:c-eq (car rc-t) (car rc-e))))))))))
+
+;; The math / comparison sites collected during one check-function run.  When
+;; the solve commits a site to a USER overload (a named/tuple operand --- a
+;; Rational +, a tuple <), the op node must be REWRITTEN to the xtm_NAME##N
+;; dispatch symbol and that symbol's closure type added to the alist, exactly
+;; the destructive rewrite the old type-check performed in place --- codegen's
+;; scalar math compiler only handles numeric (and SIMD-vector) operands, and
+;; add-types-to-source resolves the ## symbol to the registered poly instance.
+(define *xtc:infer:op-sites* '())
+(define *xtc:infer:op-counter* 0)
+
+(define xtc:infer:record-op-site!
+  (lambda (ast kind rk akeys)
+    (set! *xtc:infer:op-sites*
+          (cons (vector ast kind rk akeys) *xtc:infer:op-sites*))))
+
+;; (op a b): an overloaded call.  The numeric candidates make it the operand
+;; width (forcing the two operands equal); a registered xtm_addition / ...
+;; candidate makes it the tuple result --- the solver picks by the operand types.
+(define xtc:infer:collect-math
+  (lambda (ast bound)
+    (let* ((rc-a (xtc:infer:collect (cadr ast) bound))
+           (rc-b (xtc:infer:collect (caddr ast) bound))
+           (kr (xtc:infer:fresh-key)))
+      (xtc:infer:record-op-site! ast 'math kr (list (car rc-a) (car rc-b)))
+      (cons kr
+            (append (cdr rc-a) (cdr rc-b)
+                    (list (xtc:solve:c-overload kr
+                                                (list (car rc-a) (car rc-b))
+                                                (xtc:infer:math-candidates (car ast)))))))))
+
+;; (cmp a b): an overloaded call whose result is always i1 --- every candidate,
+;; numeric or user xtm_lessthan / ..., returns i1; the overload still has to find
+;; one, so it validates that the operands are comparable (and dispatches a tuple
+;; comparison to its overload exactly as the old xtm_lessthan## rewrite did).
+(define xtc:infer:collect-compare
+  (lambda (ast bound)
+    (let* ((rc-a (xtc:infer:collect (cadr ast) bound))
+           (rc-b (xtc:infer:collect (caddr ast) bound)))
+      (xtc:infer:record-op-site! ast 'cmp *xtc:codegen:i1*
+                                 (list (car rc-a) (car rc-b)))
+      (cons *xtc:codegen:i1*
+            (append (cdr rc-a) (cdr rc-b)
+                    (list (xtc:solve:c-overload *xtc:codegen:i1*
+                                                (list (car rc-a) (car rc-b))
+                                                (xtc:infer:compare-candidates (car ast)))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; memory / aggregates ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; The forms that read, write, allocate and build aggregate and pointer values.
+;; Two shapes recur.  A *deref* (pointer-ref / pdref) relates a pointer to its
+;; pointee structurally: a fresh pointee variable E with the operand constrained
+;; to E* (a star on E's symbol), the result E --- so when the operand resolves to
+;; i64* the pointee falls out as i64, by ordinary unification.  A *projection*
+;; (tuple/array/vector ref) cannot be expressed that way --- a tuple's fields are
+;; heterogeneous and an array's size is not known structurally --- so it emits the
+;; deferred `project' constraint, which the solver discharges once the aggregate
+;; resolves (see xtc-solve.xtm).  An allocation's result type is whatever the
+;; context (a let binding's forced type) demands, so it is a fresh variable.
+
+;; A key wrapped in one more pointer level: a star on a symbol, +pointer on a
+;; scalar code, +pointer on a compound's head.
+(define xtc:infer:ptr-of
+  (lambda (k)
+    (cond ((symbol? k) (string->symbol (string-append (symbol->string k) "*")))
+          ((number? k) (+ k *xtc:codegen:pointer*))
+          ((pair? k)   (cons (+ (car k) *xtc:codegen:pointer*) (cdr k)))
+          (else k))))
+
+;; A pointer / aggregate index is integral: the old checks direct every index
+;; position to (si64 si32), so an otherwise-unconstrained index --- a bare
+;; counter argument, an arithmetic result over untyped vars --- defaults to
+;; si64 instead of the numeric tie-break (which would pick a float).
+(define xtc:infer:index-default
+  (lambda (k)
+    (xtc:solve:c-default k (list *xtc:codegen:si64* *xtc:codegen:si32*))))
+
+;; (null? p): p is some pointer; the result is i1.  We still collect p so its own
+;; type is constrained.
+(define xtc:infer:collect-null?
+  (lambda (ast bound)
+    (cons *xtc:codegen:i1* (cdr (xtc:infer:collect (cadr ast) bound)))))
+
+;; (set! v e): v takes e's type, and the form's value is e's.  The target is
+;; collected as an ordinary symbol, so writing an undeclared variable errors
+;; here (and a global target carries its cached type) just as a read would.
+(define xtc:infer:collect-set!
+  (lambda (ast bound)
+    (let ((rc-v (xtc:infer:collect (ast:set!-var ast) bound))
+          (rc (xtc:infer:collect (ast:set!-expr ast) bound)))
+      (cons (car rc)
+            (cons (xtc:solve:c-eq (car rc-v) (car rc))
+                  (append (cdr rc-v) (cdr rc)))))))
+
+;; (stack-alloc) / (heap-alloc) / (zone-alloc), with an optional element-count
+;; argument: the result is a pointer the surrounding binding's forced type fixes,
+;; so it is a fresh variable; the count, if present, is collected for its own
+;; constraints.
+(define xtc:infer:collect-alloc
+  (lambda (ast bound)
+    (let ((k (xtc:infer:fresh-key)))
+      (if (> (length ast) 1)
+          (cons k (cdr (xtc:infer:collect (cadr ast) bound)))
+          (cons k '())))))
+
+;; (ref v): a pointer to v --- v's type with one more pointer level.
+(define xtc:infer:collect-ref
+  (lambda (ast bound)
+    (let ((rc (xtc:infer:collect (cadr ast) bound)))
+      (cons (xtc:infer:ptr-of (car rc)) (cdr rc)))))
+
+;; (pref p): one more pointer level on p; (pointer-ref p i) / (pdref p): one less
+;; (the pointee), via a fresh pointee variable.
+(define xtc:infer:collect-pref
+  (lambda (ast bound)
+    (let ((rc (xtc:infer:collect (cadr ast) bound)))
+      (cons (xtc:infer:ptr-of (car rc)) (cdr rc)))))
+
+(define xtc:infer:collect-deref
+  (lambda (ast bound)
+    (let* ((rc (xtc:infer:collect (cadr ast) bound))
+           (rc-i (if (> (length ast) 2)
+                     (xtc:infer:collect (caddr ast) bound)
+                     (cons #f '())))
+           (e (xtc:infer:fresh-key)))
+      (cons e
+            (append (cdr rc) (cdr rc-i)
+                    (if (car rc-i) (list (xtc:infer:index-default (car rc-i))) '())
+                    (list (xtc:solve:c-eq (car rc) (xtc:infer:ptr-of e))))))))
+
+;; (pointer-ref-ptr p i): a pointer to element i of p --- p's own (pointer)
+;; type, like the old check; the index is collected for its own constraints.
+(define xtc:infer:collect-pointer-ref-ptr
+  (lambda (ast bound)
+    (let ((rc (xtc:infer:collect (cadr ast) bound))
+          (rc-i (xtc:infer:collect (caddr ast) bound))
+          (e (xtc:infer:fresh-key)))
+      (cons (car rc)
+            (append (cdr rc) (cdr rc-i)
+                    (list (xtc:infer:index-default (car rc-i))
+                          (xtc:solve:c-eq (car rc) (xtc:infer:ptr-of e))))))))
+
+;; (pointer-set! p i v): p points at v's type; the form's value is v's.
+(define xtc:infer:collect-pointer-set!
+  (lambda (ast bound)
+    (let* ((rc-p (xtc:infer:collect (cadr ast) bound))
+           (rc-i (xtc:infer:collect (caddr ast) bound))
+           (rc-v (xtc:infer:collect (cadddr ast) bound)))
+      (cons (car rc-v)
+            (append (cdr rc-p) (cdr rc-i) (cdr rc-v)
+                    (list (xtc:infer:index-default (car rc-i))
+                          (xtc:solve:c-eq (car rc-p) (xtc:infer:ptr-of (car rc-v)))))))))
+
+;; A literal field index, or 0 for an array/vector whose index is a runtime value
+;; (the projection ignores the index for those --- the element type is uniform).
+(define xtc:infer:ref-index
+  (lambda (i) (if (integer? i) i 0)))
+
+;; (tuple-ref a i) / (array-ref a i) / (vector-ref a i): the result is field i of
+;; the aggregate a, a deferred projection.
+(define xtc:infer:collect-aggregate-ref
+  (lambda (ast bound)
+    (let ((rc-a (xtc:infer:collect (cadr ast) bound))
+          (rc-i (xtc:infer:collect (caddr ast) bound))
+          (k (xtc:infer:fresh-key)))
+      (cons k
+            (append (cdr rc-a) (cdr rc-i)
+                    (list (xtc:infer:index-default (car rc-i))
+                          (xtc:solve:c-project k (car rc-a)
+                                               (xtc:infer:ref-index (caddr ast)))))))))
+
+;; (tuple-set! a i v) / (array-set! a i v) / (vector-set! a i v): v IS field i of
+;; a (so the projection binds v's type), and the form's value is v's.
+(define xtc:infer:collect-aggregate-set!
+  (lambda (ast bound)
+    (let ((rc-a (xtc:infer:collect (cadr ast) bound))
+          (rc-i (xtc:infer:collect (caddr ast) bound))
+          (rc-v (xtc:infer:collect (cadddr ast) bound)))
+      (cons (car rc-v)
+            (append (cdr rc-a) (cdr rc-i) (cdr rc-v)
+                    (list (xtc:infer:index-default (car rc-i))
+                          (xtc:solve:c-project (car rc-v) (car rc-a)
+                                               (xtc:infer:ref-index (caddr ast)))))))))
+
+;; (tuple-ref-ptr a i) / (array-ref-ptr a i): a pointer to field i --- the
+;; projected field wrapped in one pointer level.
+(define xtc:infer:collect-aggregate-ref-ptr
+  (lambda (ast bound)
+    (let ((rc-a (xtc:infer:collect (cadr ast) bound))
+          (rc-i (xtc:infer:collect (caddr ast) bound))
+          (f (xtc:infer:fresh-key)))
+      (cons (xtc:infer:ptr-of f)
+            (append (cdr rc-a) (cdr rc-i)
+                    (list (xtc:infer:index-default (car rc-i))
+                          (xtc:solve:c-project f (car rc-a)
+                                               (xtc:infer:ref-index (caddr ast)))))))))
+
+;; (make-tuple e ...): a tuple of the element types.
+(define xtc:infer:collect-make-tuple
+  (lambda (ast bound)
+    (let ((rcs (map (lambda (e) (xtc:infer:collect e bound)) (cdr ast))))
+      (cons (cons *xtc:codegen:tuple* (map car rcs))
+            (apply append (map cdr rcs))))))
+
+;; (make-array e ...) / (make-vector e ...): a fixed array / SIMD vector of the
+;; (uniform) element type --- the elements unify with the first, whose type is the
+;; element.  `tag' is the array or vector int-code head.
+(define xtc:infer:collect-make-homogeneous
+  (lambda (ast bound tag)
+    (let ((rcs (map (lambda (e) (xtc:infer:collect e bound)) (cdr ast))))
+      (cons (list tag (length (cdr ast)) (car (car rcs)))
+            (append (apply append (map cdr rcs))
+                    (map (lambda (rc) (xtc:solve:c-eq (car (car rcs)) (car rc)))
+                         (cdr rcs)))))))
+
+;; (vector-shuffle a b mask...): the result is the first operand's VALUE
+;; vector --- a pointer operand is stripped, exactly the old check --- expressed
+;; through the same structural vecmath rule the math overload uses, over the
+;; two vector operands; the mask indices are collected for their own
+;; constraints only.
+(define xtc:infer:collect-vector-shuffle
+  (lambda (ast bound)
+    (let ((rcs (map (lambda (e) (xtc:infer:collect e bound)) (cdr ast)))
+          (kr (xtc:infer:fresh-key)))
+      (cons kr
+            (append (apply append (map cdr rcs))
+                    (list (xtc:solve:c-overload kr
+                                                (list (car (car rcs)) (car (cadr rcs)))
+                                                (list 'vecmath))))))))
+
+;; (llvm_callback time fn znew arg ...) --- what (callback ...) desugars to,
+;; the args wrapped in zcopy## calls and znew a fresh zone: time is i64
+;; (samples, like the old check directs it), fn a closure whose parameter
+;; slots take the argument types (the same synthesised-closure equality a
+;; call uses; its return is unconstrained); the form itself is void.
+(define xtc:infer:collect-callback
+  (lambda (ast bound)
+    (let* ((rc-t (xtc:infer:collect (cadr ast) bound))
+           (rc-f (xtc:infer:collect (caddr ast) bound))
+           (rc-z (xtc:infer:collect (cadddr ast) bound))
+           (args (map (lambda (a) (xtc:infer:collect a bound)) (cddddr ast)))
+           (rk (xtc:infer:fresh-key)))
+      (cons *xtc:codegen:void*
+            (append (cdr rc-t) (cdr rc-f) (cdr rc-z)
+                    (apply append (map cdr args))
+                    (list (xtc:solve:c-eq (car rc-t) *xtc:codegen:si64*)
+                          (xtc:solve:c-eq (car rc-f)
+                                          (xtc:infer:closure-code rk (map car args)))))))))
+
+;; The closure environment-slot forms the dot syntax (clos.slot:type) desugars
+;; to.  (closure-ref clos "slot" lltype): the result is the slot's explicit
+;; LLVM type string (the annotation), decoded; with no annotation the context
+;; fixes it, a fresh variable.  (closure-set! clos "slot" v lltype): v takes
+;; the slot type, and the form's value is v's.  (closure-refcheck clos "slot"):
+;; a slot-existence test, i1.  The closure operand is collected as an ordinary
+;; expression (a global closure / poly reference resolves through the caches);
+;; the slot-name string is a literal and carries no constraint.
+(define xtc:infer:collect-closure-ref
+  (lambda (ast bound)
+    (let ((rc (xtc:infer:collect (cadr ast) bound)))
+      (cons (if (null? (cadddr ast))
+                (xtc:infer:fresh-key)
+                (xtc:codegen:get-type-from-str (cadddr ast)))
+            (cdr rc)))))
+
+(define xtc:infer:collect-closure-set!
+  (lambda (ast bound)
+    (let ((rc (xtc:infer:collect (cadr ast) bound))
+          (rc-v (xtc:infer:collect (cadddr ast) bound)))
+      (cons (car rc-v)
+            (append (cdr rc) (cdr rc-v)
+                    (if (null? (car (cddddr ast)))
+                        '()
+                        (list (xtc:solve:c-eq
+                                (car rc-v)
+                                (xtc:codegen:get-type-from-str (car (cddddr ast)))))))))))
+
+;; push_zone / pop_zone / push_new_zone / create_zone: each yields a memory-zone
+;; pointer (%mzone*); a size argument, when present, is collected.
+(define xtc:infer:collect-zone
+  (lambda (ast bound)
+    (cons "%mzone*"
+          (if (> (length ast) 1)
+              (cdr (xtc:infer:collect (cadr ast) bound))
+              '()))))
+
+;; (num-of-elts x) / (obj-size x): a count, i64; the operand is collected.
+(define xtc:infer:collect-size-query
+  (lambda (ast bound)
+    (cons *xtc:codegen:si64*
+          (apply append (map (lambda (a) (cdr (xtc:infer:collect a bound))) (cdr ast))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; control / misc      ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; (while cond body): the condition is i1, the body runs for effect; a while
+;; evaluates to void.
+(define xtc:infer:collect-while
+  (lambda (ast bound)
+    (let ((rc-c (xtc:infer:collect (cadr ast) bound))
+          (rc-b (xtc:infer:collect (caddr ast) bound)))
+      (cons *xtc:codegen:void*
+            (append (cdr rc-c) (cdr rc-b)
+                    (list (xtc:solve:c-eq (car rc-c) *xtc:codegen:i1*)))))))
+
+;; (dotimes (i n) body) / (dotimes (i start n) body): i is a loop counter the
+;; same type as the count (and the start, when given); the body runs for effect
+;; and the form is void.  The counter is NOT a binding site --- like the old
+;; checker (and codegen, which allocates no slot for it), it must already be
+;; declared as an argument or let binding, so it is collected as an ordinary
+;; symbol and an undeclared counter errors here.
+(define xtc:infer:collect-dotimes
+  (lambda (ast bound)
+    (let* ((spec (cadr ast))
+           (rc-i (xtc:infer:collect (car spec) bound))
+           (rests (map (lambda (e) (xtc:infer:collect e bound)) (cdr spec)))
+           (rc-b (xtc:infer:collect (caddr ast) bound)))
+      (cons *xtc:codegen:void*
+            (append (cdr rc-i)
+                    (apply append (map cdr rests))
+                    (cdr rc-b)
+                    (map (lambda (rc) (xtc:solve:c-eq (car rc-i) (car rc)))
+                         rests))))))
+
+;; (bitcast v T) / (bitconvert v T): a reinterpretation / numeric conversion whose
+;; result type is the explicit target T (a coercion is a deliberate type hole, so
+;; the operand does not constrain the result); we still collect the operand.  With
+;; no target the result is fixed by context, a fresh variable.
+(define xtc:infer:collect-bitcast
+  (lambda (ast bound)
+    (let ((rc (xtc:infer:collect (cadr ast) bound)))
+      (cons (if (null? (cddr ast))
+                (xtc:infer:fresh-key)
+                (xtc:codegen:convert-from-pretty-types (caddr ast)))
+            (cdr rc)))))
+
+;; (printf fmt arg ...) and the sprintf / fprintf / sscanf / fscanf family: each
+;; returns i32; the format string and arguments are collected for their own
+;; constraints.
+(define xtc:infer:collect-printf
+  (lambda (ast bound)
+    (let ((rcs (map (lambda (a) (xtc:infer:collect a bound)) (cdr ast))))
+      (cons *xtc:codegen:si32* (apply append (map cdr rcs))))))
+
+;; (sqrt x) / (pow x y) / (fma x y z) ...: a real-valued intrinsic whose result
+;; and every argument are the one type --- so the arguments unify with the first,
+;; whose type is the result.
+(define xtc:infer:collect-math-intrinsic
+  (lambda (ast bound)
+    (let ((rcs (map (lambda (a) (xtc:infer:collect a bound)) (cdr ast))))
+      (cons (car (car rcs))
+            (append (apply append (map cdr rcs))
+                    (map (lambda (rc) (xtc:solve:c-eq (car (car rcs)) (car rc)))
+                         (cdr rcs)))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; driver              ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Infer the int-code type of an already-desugared AST node by collecting its
+;; constraints and solving them.  This is the constraint-based analogue of a
+;; run-type-check + read-off, scoped to one expression.
+(define xtc:infer:type-of
+  (lambda (ast)
+    (xtc:infer:reset-fresh!)
+    (let* ((rc (xtc:infer:collect ast '()))
+           (intern (make-hashtable))
+           (subst (xtc:solve:run (cdr rc) intern)))
+      (xtc:solve:type-of (car rc) subst intern))))
+
+;; The engine behind xtc:typecheck:run-type-check --- the whole-function
+;; entry point: given the var table, the forced (source-annotated)
+;; types, and the function's t4 AST, collect the AST's constraints, seed each
+;; forced type as an equality, solve once, and read every var's resolved type
+;; back into the (var . type) alist the driver's later phases consume.  The old
+;; entry's enumeration retry loop has no analogue --- the solver's defaulting and
+;; overload fixpoint already subsumes it.  A forced-type entry is (var . code)
+;; for a scalar and (var code...) for a compound, and in both cases its cdr is the
+;; int-code, so one c-eq form serves both.
+;; Rewrite the math / comparison sites the solve committed to a USER overload
+;; (a named/tuple operand) into their xtm_NAME##N dispatch symbols --- the same
+;; destructive set-car! the old type-check performed --- returning the alist
+;; entries those symbols need (the chosen overload's closure type, which
+;; add-types-to-source reads to inject the registered poly instance).
+(define xtc:infer:rewrite-op-sites!
+  (lambda (subst intern)
+    (cl:remove
+      #f
+      (map (lambda (site)
+             (let* ((ast (vector-ref site 0))
+                    (kind (vector-ref site 1))
+                    (rk (vector-ref site 2))
+                    (akeys (vector-ref site 3))
+                    (atypes (map (lambda (k) (xtc:solve:type-of k subst intern)) akeys))
+                    (rtype (if (eq? kind 'cmp)
+                               *xtc:codegen:i1*
+                               (xtc:solve:type-of rk subst intern)))
+                    (pname (if (eq? kind 'cmp)
+                               (xtc:infer:compare-poly-name (car ast))
+                               (xtc:infer:math-poly-name (car ast)))))
+               (and pname rtype
+                    (not (member #f atypes))
+                    (xtc:codegen:tuple? (car atypes))
+                    (begin
+                      (set! *xtc:infer:op-counter* (+ *xtc:infer:op-counter* 1))
+                      (let ((m (string->symbol
+                                 (string-append pname "##"
+                                                (number->string
+                                                  (+ 7000000 *xtc:infer:op-counter*))))))
+                        (set-car! ast m)
+                        (cons m (cons (+ *xtc:codegen:closure* (* 2 *xtc:codegen:pointer*))
+                                      (cons rtype atypes))))))))
+           *xtc:infer:op-sites*))))
+
+;; REENTRANT: encoding a fresh generic instance during the read-back triggers
+;; the instance type's data-constructor compiles, each a full nested driver
+;; run through this very function --- so the per-run state (the op/call site
+;; lists, the fresh-key counter) is rebound with let-temporarily, which
+;; restores the outer run's values on exit or on a throw.
+(define xtc:infer:check-function
+  (lambda (vars forced-types ast)
+    (let-temporarily ((*xtc:infer:fresh-counter* 0)
+                      (*xtc:infer:op-sites* '())
+                      (*xtc:infer:call-sites* '())
+                      ;; a nested exercise shares the top-level run's memo
+                      (*xtc:infer:exercise-cache* (if *xtc:infer:exercising*
+                                                      *xtc:infer:exercise-cache*
+                                                      (make-hashtable 16))))
+      (let* ((rc (xtc:infer:collect ast '()))
+             (forced (map (lambda (ft) (xtc:solve:c-eq (car ft) (cdr ft))) forced-types))
+             (intern (make-hashtable))
+             (subst (xtc:solve:run (append forced (cdr rc)) intern))
+             (call-sites *xtc:infer:call-sites*)
+             (result
+               (if (eq? subst 'conflict)
+                   (begin
+                     (if (not *xtc:infer:exercising*)
+                         (xtc:solve:explain-conflict (append forced (cdr rc)) intern))
+                     #f)
+                   ;; Read back the declared variables (the var table's keys)
+                   ;; plus the ## call-site symbols this run constrained ---
+                   ;; nothing else.  A symbol the constraints referenced that
+                   ;; neither lists (a global variable, a cached closure) is NOT
+                   ;; a local: the alist marks locals, which codegen scope-checks
+                   ;; against its sym-name-stack, so an entry would shadow the
+                   ;; cache resolution those symbols get.  The user-overload op
+                   ;; sites rewrite first; their dispatch symbols' entries join
+                   ;; the alist.
+                   (let ((pattern-vars
+                           ;; vars whose FORCED annotation carried bang variables
+                           ;; (a constructor argument spelled with a recursive
+                           ;; type's bare expansion): a residual variable in
+                           ;; their type renders as its bang, like the old
+                           ;; checker's pattern-typed entries, instead of
+                           ;; dropping the entry
+                           (cl:remove #f
+                                      (map (lambda (ft)
+                                             (and (pair? (xtc:infer:bang-vars (cdr ft)))
+                                                  (car ft)))
+                                           forced-types))))
+                     (append
+                       (xtc:infer:rewrite-op-sites! subst intern)
+                       (cl:remove #f
+                                  (map (lambda (sym)
+                                         (let ((ty (or (xtc:solve:type-of sym subst intern)
+                                                       (and (memq sym pattern-vars)
+                                                            (xtc:solve:type-of-open sym subst intern)))))
+                                           ;; a call site whose type retains a residual
+                                           ;; variable cannot be read back; the entry is
+                                           ;; dropped and add-types-to-source errors at the
+                                           ;; site --- name the site and the open type here,
+                                           ;; because the downstream error's alist cannot
+                                           (if (and (not ty) (memq sym call-sites)
+                                                    (not *xtc:infer:exercising*))
+                                               (xtc:diagnostics:print-compiler-warning
+                                                 (string-append
+                                                   "xtc:infer: unresolved call site dropped: "
+                                                   (symbol->string sym) " : "
+                                                   (sexpr->string
+                                                     (xtc:type:apply-subst
+                                                       (xtc:type:from-intcode sym intern) subst)))))
+                                           (and ty (cons sym ty))))
+                                       (cl:remove-duplicates
+                                         (append (hashtable-keys vars) call-sites)))))))))
+        result))))
+
+;; the solver's deferred exercise constraint reifies through this module
+(set! *xtc:solve:exercise-hook* xtc:infer:exercise-generic)
+

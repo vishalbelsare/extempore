@@ -25,19 +25,19 @@
 ;;; Code:
 
 ;; lib-loading config
-(if *impc:compiler:with-cache* (sys:load "libs/aot-cache/audio_dsp.xtm" 'quiet))
+(if *xtc:globals:with-cache* (sys:load "libs/aot-cache/audio_dsp.xtm" 'quiet))
 (sys:load-preload-check 'audio_dsp)
 (define *xtmlib-audio_dsp-loaded* #t)
 
-(impc:aot:suppress-aot-do
- (sys:load "libs/core/rational.xtm")
- (sys:load "libs/core/audiobuffer.xtm"))
-(impc:aot:insert-forms
- (sys:load "libs/core/rational.xtm" 'quiet)
- (sys:load "libs/core/audiobuffer.xtm" 'quiet))
+(xtc:aot:suppress-aot-do
+  (sys:load "libs/core/rational.xtm")
+  (sys:load "libs/core/audiobuffer.xtm"))
+(xtc:aot:insert-forms
+  (sys:load "libs/core/rational.xtm" 'quiet)
+  (sys:load "libs/core/audiobuffer.xtm" 'quiet))
 
-(impc:aot:insert-header "xtmaudio_dsp")
-(impc:aot:import-ll "xtmaudio_dsp")
+(xtc:aot:insert-header "xtmaudio_dsp")
+(xtc:aot:import-ll "xtmaudio_dsp")
 
 (bind-func print_audio_state
   (lambda ()
@@ -146,15 +146,15 @@
       (lambda (chan:i64 x:SAMPLE)
         (if (= chan 0)
             (begin (pset! dl (% t lgth) (* x x))
-                   (set! t (+ t 1))
-                   ;;(printf "left %f\n" (ftod left))
-                   (if (= 0 (% t lgth))
-                       (begin
-                         (set! left (+ 3.0 (amp2db (sqrt (calc_vmean dl lgth)))))
-                         (set! right (+ 3.0 (amp2db (sqrt (calc_vmean dr lgth)))))))
-                   void)
+              (set! t (+ t 1))
+              ;;(printf "left %f\n" (ftod left))
+              (if (= 0 (% t lgth))
+                  (begin
+                    (set! left (+ 3.0 (amp2db (sqrt (calc_vmean dl lgth)))))
+                    (set! right (+ 3.0 (amp2db (sqrt (calc_vmean dr lgth)))))))
+              void)
             (begin (pset! dr (% t lgth) (* x x))
-                   void))
+              void))
         x))))
 
 ;; amount of curve
@@ -177,12 +177,12 @@
           (t (/ (i64tod time) (i64tod width))))
       (if (< p 0.0)
           (begin (set! p (fabs p))
-                 (set! t (- 1.0 t))))
+            (set! t (- 1.0 t))))
       (let ((out (* amp (/ (- (pow p t) 1.0) (- p 1.0)))))
         (convert
-         (if (> out amp) amp
-             (if (< out 0.0) 0.0
-                 out)))))))
+          (if (> out amp) amp
+              (if (< out 0.0) 0.0
+                  out)))))))
 
 
 ;; given current channel
@@ -244,7 +244,7 @@
                 (dsp_randn)
                 (* v1 (sqrt (/ (* -2.0 (log s)) s))))
             (begin (set! phase (- 1 phase))
-                   (* v2 (sqrt (/ (* -2.0 (log s)) s)))))))))
+              (* v2 (sqrt (/ (* -2.0 (log s)) s)))))))))
 
 
 ;; high precision
@@ -445,8 +445,6 @@
           (set! out (* out -1.0)))
       out)))
 
-;; (sys:load "libs/core/bleptables.xtm")
-
 (bind-val BLEPTable |4096,double|*)
 (bind-val fBLEPTable |4096,float|*)
 (bind-val BLEPTable_8_BLKHAR |4096,double|*)
@@ -468,7 +466,7 @@
             (set! fBLEPTable_8_BLKHAR (convert (pref-ptr data offset)))
             void)))))
 
-(impc:aot:do-or-emit
+(xtc:aot:do-or-emit
   ($ (load_blep_tables_from_blob "libs/core/bleptables.dump")))
 
 (bind-func static LinTerp
@@ -553,36 +551,6 @@
       blep)))
 
 
-;; bandlimited sawtooth (blep variant of saw_c)
-;;
-;; mod is phase between 0.0-1.0 (i.e. not 2pi)
-;; ramp is rising by default (invert for falling)
-;; (bind-func blsaw_c
-;;   (lambda (mod inverted:i1)
-;;     (let ((inc 0.0) (absinc 0.0:f) (out 0.0) (blep 0.0) (t 0.0)
-;;           (rising (if inverted 1 0))
-;;           (inv (if inverted -1.0 1.0)))
-;;       (lambda (amp:float frq:float)
-;;         (set! inc (/ frq SRs))
-;;         ;; positive frequencies
-;;         (if (and (> inc 0.0) (>= mod 1.0))
-;;             (set! mod (- mod 1.0)))
-;;         ;; negative frequencies
-;;         (if (and (< inc 0.0) (<= mod 0.0))
-;;             (set! mod (+ mod 1.0)))
-;;         ;; inline polyblep
-;;         (set! absinc (fabs inc))
-;;         (set! blep 0.0)
-;;         (if (> mod (- 1.0 absinc))
-;;             (begin (set! t (/ (- mod 1.0) absinc))
-;;                    (set! blep (+ (* t t) (* 2.0 t) 1.0)))
-;;             (if (< mod absinc)
-;;                 (begin (set! t (/ mod absinc))
-;;                        (set! blep (- (* 2.0 t) (* t t) 1.0)))))
-;;         (if (not rising) (set! blep (* blep -1.0)))
-;;         (set! out (* inv (- (* mod 2.0) 1.0))) ;; bipolar
-;;         (set! mod (+ mod inc)) ;; update mod
-;;         (* amp (+ out blep))))))
 
 ;; bandlimited sawtooth (blep variant of saw_c)
 ;;
@@ -636,66 +604,6 @@
     (blsaw_mc_c:[[float,i64,float,float]*,float,i1,i1]* mod 0 0)))
 
 ;;;;;;;;;;;; pulse waves
-
-
-;; bandlimited pulse wave
-;; use sum of saws method
-;; (bind-func blpulse_c
-;;   (lambda (mod:float)
-;;     (let ((out 0.0) (inc 0.0) (mod2:float 0.0)
-;;           (blep 0.0:f) (absinc 0.0) (t 0.0)
-;;           (saw1 0.0) (saw2 0.0) (dcorr 0.0))
-;;       (lambda (amp:float frq:float pw:float)
-;;         (set! pw (clamp (fabs pw) 0.05 0.95))
-;;         (set! inc (/ frq SRs))
-;;         ;; positive frequencies
-;;         (if (and (> inc 0.0) (>= mod 1.0))
-;;             (set! mod (- mod 1.0)))
-;;         ;; negative frequencies
-;;         (if (and (< inc 0.0) (<= mod 0.0))
-;;             (set! mod (+ mod 1.0)))
-;;         ;; saw 1
-;;         ;; inline polyblep
-;;         (set! absinc (fabs inc))
-;;         (set! blep 0.0)
-;;         (if (> mod (- 1.0 absinc))
-;;             (begin (set! t (/ (- mod 1.0) absinc))
-;;                    (set! blep (+ (* t t) (* 2.0 t) 1.0)))
-;;             (if (< mod absinc)
-;;                 (begin (set! t (/ mod absinc))
-;;                        (set! blep (- (* 2.0 t) (* t t) 1.0)))))
-;;         (set! saw1 (+ blep (- (* mod 2.0) 1.0)))
-;;         ;; saw 2
-;;         ;; first calc offset for saw2 based on pw
-;;         (if (> inc 0.0)
-;;             (set! mod2 (+ mod pw))
-;;             (set! mod2 (- mod pw)))
-;;         ;; positive frequencies
-;;         (if (and (> inc 0.0) (>= mod2 1.0))
-;;             (set! mod2 (- mod2 1.0)))
-;;         ;; negative frequencies
-;;         (if (and (< inc 0.0) (<= mod2 0.0))
-;;             (set! mod2 (+ mod2 1.0)))
-;;         ;; saw 2
-;;         ;; inline polyblep
-;;         (set! absinc (fabs inc))
-;;         (set! blep 0.0)
-;;         (if (> mod2 (- 1.0 absinc))
-;;             (begin (set! t (/ (- mod2 1.0) absinc))
-;;                    (set! blep (+ (* t t) (* 2.0 t) 1.0)))
-;;             (if (< mod2 absinc)
-;;                 (begin (set! t (/ mod2 absinc))
-;;                        (set! blep (- (* 2.0 t) (* t t) 1.0)))))
-;;         (set! saw2 (+ blep (- (* mod2 2.0) 1.0)))
-;;         ;; subtract 180 out of phase
-;;         (set! out (- (* 0.5 saw1) (* 0.5 saw2)))
-;;         ;; dc correction
-;;         (set! dcorr (/ 1.0 pw))
-;;         (if (< pw 0.5)
-;;             (set! dcorr (/ 1.0 (- 1.0 pw))))
-;;         (set! out (* out dcorr))
-;;         (set! mod (+ mod inc)) ;; update mod
-;;         (* amp out)))))
 
 
 ;; bandlimited pulse wave
@@ -813,11 +721,11 @@
         ;; positive frequencies
         (if (and (> inc 0.0) (>= mod 1.0))
             (begin (set! mod (- mod 1.0))
-                   (set! sqrmod (* sqrmod -1.0))))
+              (set! sqrmod (* sqrmod -1.0))))
         ;; negative frequencies
         (if (and (< inc 0.0) (<= mod 0.0))
             (begin (set! mod (+ mod 1.0))
-                   (set! sqrmod (* sqrmod -1.0))))
+              (set! sqrmod (* sqrmod -1.0))))
         ;; start with saw
         (set! sawout (- (* mod 2.0) 1.0)) ;; bipolar sawtooth
         (set! sawout (* sawout sawout)) ;; sqr'd sawtooth
@@ -965,29 +873,29 @@
             ((= type HPF4) (set! m_dA 1.0) (set! m_dB -4.0) (set! m_dC 6.0) (set! m_dD -4.0) (set! m_dE 1.0))
             ((= type HPF2) (set! m_dA 1.0) (set! m_dB -4.0) (set! m_dC 6.0) (set! m_dD -4.0) (set! m_dE 1.0))
             (else ;; default to LPF4
-             (set! m_dA 0.0) (set! m_dB 0.0) (set! m_dC 0.0) (set! m_dD 0.0) (set! m_dE 1.0)))
+                  (set! m_dA 0.0) (set! m_dB 0.0) (set! m_dC 0.0) (set! m_dD 0.0) (set! m_dE 1.0)))
       (lambda (in:SAMPLE frq:SAMPLE Q:SAMPLE)
         ;; update Q
         (if (or (<> oldQ Q) (<> oldfrq frq))
             (begin (if (< frq 0.0) (set! frq (fabs frq)))
-                   (if (< Q 0.0) (set! Q (fabs Q)))
-                   (set! oldQ Q)
-                   (set! oldfrq frq)
-                   (set! m_dK (* 4.0 Q))
-                   (set! oldfrq frq)
-                   (set! m_dAlpha (* t2 (tan (* STWOPI frq halfT))))
-                   (set! g (* halfT m_dAlpha))
-                   (set! G (/ g (+ 1.0 g)))
-                   (pset! lpf1alpha 0 G)
-                   (pset! lpf2alpha 0 G)
-                   (pset! lpf3alpha 0 G)
-                   (pset! lpf4alpha 0 G)
-                   (pset! lpf1beta 0 (* G G (/ G (+ 1.0 g))))
-                   (pset! lpf2beta 0 (* G (/ G (+ 1.0 g))))
-                   (pset! lpf3beta 0 (/ G (+ 1.0 g)))
-                   (pset! lpf4beta 0 (/ 1.0 (+ 1.0 g)))
-                   (set! m_dGamma (* G G G G))
-                   (set! m_dAlpha_0 (/ 1.0 (+ 1.0 (* m_dK m_dGamma))))))
+              (if (< Q 0.0) (set! Q (fabs Q)))
+              (set! oldQ Q)
+              (set! oldfrq frq)
+              (set! m_dK (* 4.0 Q))
+              (set! oldfrq frq)
+              (set! m_dAlpha (* t2 (tan (* STWOPI frq halfT))))
+              (set! g (* halfT m_dAlpha))
+              (set! G (/ g (+ 1.0 g)))
+              (pset! lpf1alpha 0 G)
+              (pset! lpf2alpha 0 G)
+              (pset! lpf3alpha 0 G)
+              (pset! lpf4alpha 0 G)
+              (pset! lpf1beta 0 (* G G (/ G (+ 1.0 g))))
+              (pset! lpf2beta 0 (* G (/ G (+ 1.0 g))))
+              (pset! lpf3beta 0 (/ G (+ 1.0 g)))
+              (pset! lpf4beta 0 (/ 1.0 (+ 1.0 g)))
+              (set! m_dGamma (* G G G G))
+              (set! m_dAlpha_0 (/ 1.0 (+ 1.0 (* m_dK m_dGamma))))))
         (set! dSigma (+ (pref lpf1output 0) (pref lpf2output 0) (pref lpf3output 0) (pref lpf4output 0)))
         (set! in (* in (+ 1.0 m_dK)))
         (set! dU (* (- in (* m_dK dSigma)) m_dAlpha_0))
@@ -1582,26 +1490,6 @@ but v1 and v2 can be computed in parallel"
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
-;; ;; pulse train
-;; (bind-func pulse_c
-;;   (lambda ()
-;;     (let ((time -1.0)
-;;           (period:SAMPLE 0.0))
-;;       (lambda (amp:SAMPLE freq width)
-;;         (set! period (/ SAMPLERATE freq))
-;;         (set! time (+ time 1.0))
-;;         (if (< (modulo time period) width)
-;;             amp
-;;             0.0)))))
-
-;; (bind-func pulse_mc_c
-;;   (lambda ()
-;;     (let ((pulse (pulse_c))
-;;           (mem 0.0))
-;;       (lambda (chan:i64 amp freq width)
-;;         (if (= chan 0) (set! mem (pulse amp freq width)))
-;;         mem))))
-
 ;; linear fade closure
 (bind-func static fade_c
   (lambda ()
@@ -1695,10 +1583,10 @@ but v1 and v2 can be computed in parallel"
       (lambda (x:SAMPLE delay:SAMPLE in:SAMPLE mix:SAMPLE fb:SAMPLE)
         (if (<> delay olddelay)
             (begin (set! olddelay delay)
-                   (set! alpha (- delay (floor delay)))
-                   (set! idelay (convert (floor delay)))
-                   (set! out_head (- (+ maxdelay in_head) idelay))
-                   (set! out_head_alpha (- (+ maxdelay in_head) (+ 1 idelay)))))
+              (set! alpha (- delay (floor delay)))
+              (set! idelay (convert (floor delay)))
+              (set! out_head (- (+ maxdelay in_head) idelay))
+              (set! out_head_alpha (- (+ maxdelay in_head) (+ 1 idelay)))))
         (if (> out_head maxdelay) (set! out_head (- out_head maxdelay)))
         (if (> out_head_alpha maxdelay) (set! out_head_alpha (- out_head_alpha maxdelay)))
         (if (> in_head maxdelay) (set! in_head (- in_head maxdelay)))
@@ -1740,10 +1628,10 @@ but v1 and v2 can be computed in parallel"
       (lambda (x:SAMPLE delay:SAMPLE apf_gain:SAMPLE)
         (if (<> delay olddelay)
             (begin (set! olddelay delay)
-                   (set! alpha (- delay (floor delay)))
-                   (set! idelay (convert (floor delay)))
-                   (set! out_head (- (+ maxdelay in_head) idelay))
-                   (set! out_head_alpha (- (+ maxdelay in_head) (+ 1 idelay)))))
+              (set! alpha (- delay (floor delay)))
+              (set! idelay (convert (floor delay)))
+              (set! out_head (- (+ maxdelay in_head) idelay))
+              (set! out_head_alpha (- (+ maxdelay in_head) (+ 1 idelay)))))
         (if (> out_head maxdelay) (set! out_head (- out_head maxdelay)))
         (if (> out_head_alpha maxdelay) (set! out_head_alpha (- out_head_alpha maxdelay)))
         (if (> in_head maxdelay) (set! in_head (- in_head maxdelay)))
@@ -1792,7 +1680,7 @@ but v1 and v2 can be computed in parallel"
                    (+ (* ms low)
                       (clamp (* ms high (+ 0.5 (modl 0.5 rate)))
                              0.0 halfsrf))
-                  in out feedback)
+                   in out feedback)
             (if (= chan 1)
                 (combr x
                        (+ (* ms low)
@@ -1910,15 +1798,15 @@ but v1 and v2 can be computed in parallel"
             (begin
               (if (<> size oldsize)
                   (begin (set! oldsize size)
-                         (set! size (* size 5000.0))
-                         (set! comb1_fb (comb_fb_from_rtsixty size comb1_delay))
-                         (set! comb2_fb (comb_fb_from_rtsixty size comb2_delay))
-                         (set! comb3_fb (comb_fb_from_rtsixty size comb3_delay))
-                         (set! comb4_fb (comb_fb_from_rtsixty size comb4_delay))
-                         (set! comb5_fb (comb_fb_from_rtsixty size comb5_delay))
-                         (set! comb6_fb (comb_fb_from_rtsixty size comb6_delay))
-                         (set! comb7_fb (comb_fb_from_rtsixty size comb7_delay))
-                         (set! comb8_fb (comb_fb_from_rtsixty size comb8_delay))))
+                    (set! size (* size 5000.0))
+                    (set! comb1_fb (comb_fb_from_rtsixty size comb1_delay))
+                    (set! comb2_fb (comb_fb_from_rtsixty size comb2_delay))
+                    (set! comb3_fb (comb_fb_from_rtsixty size comb3_delay))
+                    (set! comb4_fb (comb_fb_from_rtsixty size comb4_delay))
+                    (set! comb5_fb (comb_fb_from_rtsixty size comb5_delay))
+                    (set! comb6_fb (comb_fb_from_rtsixty size comb6_delay))
+                    (set! comb7_fb (comb_fb_from_rtsixty size comb7_delay))
+                    (set! comb8_fb (comb_fb_from_rtsixty size comb8_delay))))
               (set! input x)
               ;; predelay
               (set! dly1_delay (* predelay MILLIS))
@@ -1986,15 +1874,15 @@ but v1 and v2 can be computed in parallel"
             (begin
               (if (<> size oldsize)
                   (begin (set! oldsize size)
-                         (set! size (* size 5000.0))
-                         (set! comb1_fb (comb_fb_from_rtsixty size comb1_delay))
-                         (set! comb2_fb (comb_fb_from_rtsixty size comb2_delay))
-                         (set! comb3_fb (comb_fb_from_rtsixty size comb3_delay))
-                         (set! comb4_fb (comb_fb_from_rtsixty size comb4_delay))
-                         (set! comb5_fb (comb_fb_from_rtsixty size comb5_delay))
-                         (set! comb6_fb (comb_fb_from_rtsixty size comb6_delay))
-                         (set! comb7_fb (comb_fb_from_rtsixty size comb7_delay))
-                         (set! comb8_fb (comb_fb_from_rtsixty size comb8_delay))))
+                    (set! size (* size 5000.0))
+                    (set! comb1_fb (comb_fb_from_rtsixty size comb1_delay))
+                    (set! comb2_fb (comb_fb_from_rtsixty size comb2_delay))
+                    (set! comb3_fb (comb_fb_from_rtsixty size comb3_delay))
+                    (set! comb4_fb (comb_fb_from_rtsixty size comb4_delay))
+                    (set! comb5_fb (comb_fb_from_rtsixty size comb5_delay))
+                    (set! comb6_fb (comb_fb_from_rtsixty size comb6_delay))
+                    (set! comb7_fb (comb_fb_from_rtsixty size comb7_delay))
+                    (set! comb8_fb (comb_fb_from_rtsixty size comb8_delay))))
               (set! input x)
               ;; predelay
               (set! dly1_delay (* predelay MILLIS))
@@ -2054,7 +1942,7 @@ but v1 and v2 can be computed in parallel"
         (if (> h 0.0)
             mem
             (begin (set! mem in)
-                   in))))))
+              in))))))
 
 (bind-func static hold_mc_c
   (lambda (channels:i64)
@@ -2162,6 +2050,18 @@ but v1 and v2 can be computed in parallel"
 
 
 
+;; both granulators draw from a fixed pool of grains and read from a ring
+;; buffer of recent input. The grain arrays below are declared with a literal
+;; extent, which has to match GRANULATOR_MAX_GRAINS.
+(bind-val GRANULATOR_MAX_GRAINS i64 200)
+;; 4 seconds of input per channel at 44100
+(bind-val GRANULATOR_CACHE_FRAMES i64 176400)
+;; a new grain starts this many samples into the cache, far enough back that
+;; the writer doesn't overtake it
+(bind-val GRANULATOR_GRAIN_LEAD i64 128)
+;; grains are retired once this little of their duration is left
+(bind-val GRANULATOR_MIN_DURATION double 8.0)
+
 ;; a rough and ready granulator
 ;; expects to work on 'n' channels
 ;; see examples/external/granular.xtm
@@ -2184,7 +2084,7 @@ but v1 and v2 can be computed in parallel"
           (gidx 0)
           (offset 0)
           (out:SAMPLE 0.0) (i 0)
-          (cachesize:i64 (* 88200 2 channels))
+          (cachesize:i64 (* GRANULATOR_CACHE_FRAMES channels))
           (cnt cachesize)
           (audio_cache:SAMPLE* (alloc cachesize))
           (lengths:|200,double|* (alloc))
@@ -2195,7 +2095,11 @@ but v1 and v2 can be computed in parallel"
           (rates:|200,double|* (alloc))
           (panning:|200,float|* (alloc))
           (active:|200,i1|* (alloc)))
-      (dotimes (i 200) (aset! active i 0))
+      (dotimes (i GRANULATOR_MAX_GRAINS) (aset! active i 0))
+      ;; a grain created in the first GRANULATOR_GRAIN_LEAD samples reads
+      ;; from the far end of the cache, which the writer hasn't reached yet,
+      ;; so that end has to start out silent
+      (dotimes (i cachesize) (pset! audio_cache i 0.0))
       (lambda (chan time:i64 in)
         (set! iotn (+ iotn 1))
         (pset! audio_cache (% cnt cachesize) in)
@@ -2211,17 +2115,17 @@ but v1 and v2 can be computed in parallel"
               (aset! rates gidx (+ rlo (* (- rhi rlo)  (random))))
               (set! offset
                     (if (> (aref rates gidx) 1.0)
-                        (+ 128
+                        (+ GRANULATOR_GRAIN_LEAD
                            (* channels (dtoi64 (floor (- (* (aref rates gidx)
                                                             (aref lengths gidx))
                                                          (aref lengths gidx))))))
-                        128))
+                        GRANULATOR_GRAIN_LEAD))
               (aset! startidx gidx (% (- cnt offset) cachesize))
               (aset! phases gidx 0.0)
-              (set! gidx (% (+ gidx 1) 200))))
+              (set! gidx (% (+ gidx 1) GRANULATOR_MAX_GRAINS))))
         (set! cnt (+ cnt 1))
         (set! out 0.0)
-        (dotimes (i 200)
+        (dotimes (i GRANULATOR_MAX_GRAINS)
           (if (= 1:i1 (aref active i))
               (begin
                 (set! idx (+ (aref startidx i)
@@ -2236,7 +2140,7 @@ but v1 and v2 can be computed in parallel"
                     (begin
                       (aset! phases i (+ (aref phases i) (aref rates i)))
                       (aset! durations i (- (aref durations i) (aref rates i)))))
-                (if (< (aref durations i) 8.0)
+                (if (< (aref durations i) GRANULATOR_MIN_DURATION)
                     (begin
                       (aset! active i 0)
                       void)
@@ -2269,7 +2173,7 @@ but v1 and v2 can be computed in parallel"
           (offset 0)
           (y1 0.0) (x0 0.0) (x1 0.0) (x2 0.0)
           (out:SAMPLE 0.0) (i 0)
-          (cachesize:i64 (* 88200 2 channels))
+          (cachesize:i64 (* GRANULATOR_CACHE_FRAMES channels))
           (cnt cachesize)
           (audio_cache:SAMPLE* (alloc cachesize))
           (lengths:|200,double|* (alloc))
@@ -2280,7 +2184,11 @@ but v1 and v2 can be computed in parallel"
           (rates:|200,double|* (alloc))
           (panning:|200,float|* (alloc))
           (active:|200,i1|* (alloc)))
-      (dotimes (i 200) (aset! active i 0))
+      (dotimes (i GRANULATOR_MAX_GRAINS) (aset! active i 0))
+      ;; a grain created in the first GRANULATOR_GRAIN_LEAD samples reads
+      ;; from the far end of the cache, which the writer hasn't reached yet,
+      ;; so that end has to start out silent
+      (dotimes (i cachesize) (pset! audio_cache i 0.0))
       (lambda (chan time:i64 in)
         (set! iotn (+ iotn 1))
         (pset! audio_cache (% cnt cachesize) in)
@@ -2296,17 +2204,17 @@ but v1 and v2 can be computed in parallel"
               (aset! rates gidx (+ rlo (* (- rhi rlo)  (random))))
               (set! offset
                     (if (> (aref rates gidx) 1.0)
-                        (+ 128
+                        (+ GRANULATOR_GRAIN_LEAD
                            (* channels (dtoi64 (floor (- (* (aref rates gidx)
                                                             (aref lengths gidx))
                                                          (aref lengths gidx))))))
-                        128))
+                        GRANULATOR_GRAIN_LEAD))
               (aset! startidx gidx (% (- cnt offset) cachesize))
               (aset! phases gidx 0.0)
-              (set! gidx (% (+ gidx 1) 200))))
+              (set! gidx (% (+ gidx 1) GRANULATOR_MAX_GRAINS))))
         (set! cnt (+ cnt 1))
         (set! out 0.0)
-        (dotimes (i 200)
+        (dotimes (i GRANULATOR_MAX_GRAINS)
           (if (= 1:i1 (aref active i))
               (begin
                 (set! idx (+ (aref startidx i)
@@ -2325,7 +2233,7 @@ but v1 and v2 can be computed in parallel"
                     (begin
                       (aset! phases i (+ (aref phases i) (aref rates i)))
                       (aset! durations i (- (aref durations i) (aref rates i)))))
-                (if (< (aref durations i) 8.0)
+                (if (< (aref durations i) GRANULATOR_MIN_DURATION)
                     (begin
                       (aset! active i 0)
                       void)
@@ -2762,25 +2670,6 @@ but v1 and v2 can be computed in parallel"
 ;; based on Steve Harris's Valve Saturation lv2 plugin
 ;; http://plugin.org.uk/
 
-;; (bind-func saturation_c
-;;   "level:[0.0,1.0] character:[0.0,1.0]"
-;;   (lambda ()
-;;     (let ((itm1 0.0)
-;;           (otm1 0.0))
-;;       (lambda (x:SAMPLE level:SAMPLE character:SAMPLE)
-;;         (set! level (clamp level .001 0.999))
-;;         (let ((q (- level 0.999))
-;;               (dist (+ (* character 40.0) 0.1))
-;;               (fx (if (= x q)
-;;                       (/ (/ 1.0 (+ dist q))
-;;                          (- 1.0 (exp (* dist q))))
-;;                       (/ (/ (- x q)
-;;                             (+ (- 1.0 (exp (* -1.0 dist (- x q)))) q))
-;;                          (- 1.0 (exp (* dist q)))))))
-;;           (set! otm1 (- (+ (* 0.999 otm1) fx) itm1))
-;;           (set! itm1 fx)
-;;           otm1)))))
-
 (bind-func static saturation_c
   "level:[0.0,1.0] character:[0.0,1.0]"
   (lambda ()
@@ -3019,21 +2908,21 @@ but v1 and v2 can be computed in parallel"
             (begin
               (if (< g 0.00001:f)
                   (begin (set! t 0.0)
-                         (set! aa (+ 1.0 (* a .001 SRs)))
-                         (set! dd (+ 1.0 (* d .001 SRs)))
-                         (set! inc1 (/ 1.0 aa))
-                         (set! inc2 (/ 1.0 dd))
-                         void)
+                    (set! aa (+ 1.0 (* a .001 SRs)))
+                    (set! dd (+ 1.0 (* d .001 SRs)))
+                    (set! inc1 (/ 1.0 aa))
+                    (set! inc2 (/ 1.0 dd))
+                    void)
                   (begin (inc t 1.0)
-                         void))
+                    void))
               (cond ((> t (+ aa dd))
                      (if (and cycle (> g 0.0)) ; (< out 0.0001))
                          (begin (set! t 0.0)
-                                (set! aa (+ 1.0 (* a .001 SRs)))
-                                (set! dd (+ 1.0 (* d .001 SRs)))
-                                (set! inc1 (/ 1.0 aa))
-                                (set! inc2 (/ 1.0 dd))
-                                void))
+                           (set! aa (+ 1.0 (* a .001 SRs)))
+                           (set! dd (+ 1.0 (* d .001 SRs)))
+                           (set! inc1 (/ 1.0 aa))
+                           (set! inc2 (/ 1.0 dd))
+                           void))
                      (set! time 0.0)
                      (set! out 0.0)) ;(clamp (- out .001) 0.0 1.0)))
                     ((> t aa)
@@ -3046,46 +2935,6 @@ but v1 and v2 can be computed in parallel"
               out))))))
 
 
-;; chan, gate, attack, decay, sustain, release
-;; (bind-func adsr_c
-;;   (lambda ()
-;;     (let ((t:double 0.0)
-;;           (tt:i64 0)
-;;           (out:double 0.0)
-;;           (ms (* .001 SRd))
-;;           (a 0.0) (d 0.0) (r 0.0) (s 0.0)
-;;           (t1 0.0) (t2 0.0) (t3 0.0) (t4 0.0)
-;;           (inc1 0.0) (inc2 0.0) (inc3 0.0))
-;;       (lambda (chan:i64 g:float aa:float dd:float ss:float rr:float)
-;;         (if (<> chan 0)
-;;             (dtof out)
-;;             (begin
-;;               (set! a (+ 1.0 (* (ftod aa) ms)))
-;;               (set! d (+ 1.0 (* (ftod dd) ms)))
-;;               (set! r (+ 1.0 (* (ftod rr) ms)))
-;;               (set! s (ftod ss))
-;;               (if (< g 0.00001:f) (set! t 0.0) (set! t (+ t 1.0)))
-;;               ;; (set! t1 a)
-;;               ;; (set! t2 (+ a d))
-;;               (cond ((< t 0.001)
-;;                      (set! inc3 (if (or (< s .01) (> out (+ s 0.001))) (/ 1.0 r) (/ s r)))
-;;                      (set! out (- out inc3))) ;; release
-;;                     ((> t (+ a d)) out) ;(set! out s)) ;; sustain
-;;                     ((> t a)
-;;                      (set! inc2 (/ (- 1.0 s) d))
-;;                      (set! out (- out inc2))) ;; decay
-;;                     ((> t 0.0)
-;;                      (set! inc1 (/ 1.0 a))
-;;                      (set! out (+ out inc1))) ;; attack
-;;                     (else (set! out (- out .01)))) ;; fast decay to 0.0 (shouldn't get here!)
-;;               (set! out (clamp out 0.0 1.0))
-;;               (dtof out)))))))
-
-
-
-;;
-;;
-;;
 (bind-func static adsr_c
   (lambda ()
     (let ((calcCoef (lambda (rate:float targetRatio:float)
@@ -3118,8 +2967,8 @@ but v1 and v2 can be computed in parallel"
             (begin
               (if retrigger
                   (begin (set! retrigger 0)
-                         ;; (set! out 0.0)
-                         (set! state env_attack)))
+                    ;; (set! out 0.0)
+                    (set! state env_attack)))
               (if (<> a old_a)
                   (begin
                     (set! old_a a)
@@ -3156,20 +3005,20 @@ but v1 and v2 can be computed in parallel"
                      (set! out (+ attackBase (* out attackCoef)))
                      (if (>= out 1.0)
                          (begin (set! out 1.0)
-                                (set! state env_decay)))
+                           (set! state env_decay)))
                      out)
                     ((= state env_decay)
                      (set! out (+ decayBase (* out decayCoef)))
                      (if (<= out sustainLevel)
                          (begin (set! out sustainLevel)
-                                (set! state env_sustain)))
+                           (set! state env_sustain)))
                      out)
                     ((= state env_sustain) out)
                     ((= state env_release)
                      (set! out (+ releaseBase (* out releaseCoef)))
                      (if (<= out 0.0)
                          (begin (set! out 0.0)
-                                (set! state env_idle)))
+                           (set! state env_idle)))
                      out)))
             out)))))
 
@@ -3208,8 +3057,8 @@ but v1 and v2 can be computed in parallel"
             (begin
               (if retrigger
                   (begin (set! retrigger 0)
-                         ;; (set! out 0.0)
-                         (set! state env_attack)))
+                    ;; (set! out 0.0)
+                    (set! state env_attack)))
               (if (<> a old_a)
                   (begin
                     (set! old_a a)
@@ -3236,40 +3085,40 @@ but v1 and v2 can be computed in parallel"
               (if (<> g old_g)
                   (if (> g 0.1)
                       (cond ((> del 0.00001)
-                               (set! state env_predelay)
-                               (set! delay (ftoi64 (* del SRf 0.001))))
+                             (set! state env_predelay)
+                             (set! delay (ftoi64 (* del SRf 0.001))))
                             ((> a 0.00001) (set! state env_attack))
                             ((> d 0.00001) (set! out 1.0) (set! state env_decay))
                             (else (set! out sustainLevel) (set! state env_sustain)))
                       (set! state env_release)))
               (set! old_g g)
               (cond ((= state env_idle)
-                      out)
+                     out)
                     ((= state env_predelay)
-                      (set! delay (- delay 1))
-                      (if (<= delay 0)
-                          (cond ((> a 0.00001) (set! state env_attack))
-                                ((> d 0.00001) (set! out 1.0) (set! state env_decay))
-                                (else (set! out sustainLevel) (set! state env_sustain))))
-                      out)
+                     (set! delay (- delay 1))
+                     (if (<= delay 0)
+                         (cond ((> a 0.00001) (set! state env_attack))
+                               ((> d 0.00001) (set! out 1.0) (set! state env_decay))
+                               (else (set! out sustainLevel) (set! state env_sustain))))
+                     out)
                     ((= state env_attack)
                      (set! out (+ attackBase (* out attackCoef)))
                      (if (>= out 1.0)
                          (begin (set! out 1.0)
-                                (set! state env_decay)))
+                           (set! state env_decay)))
                      out)
                     ((= state env_decay)
                      (set! out (+ decayBase (* out decayCoef)))
                      (if (<= out sustainLevel)
                          (begin (set! out sustainLevel)
-                                (set! state env_sustain)))
+                           (set! state env_sustain)))
                      out)
                     ((= state env_sustain) out)
                     ((= state env_release)
                      (set! out (+ releaseBase (* out releaseCoef)))
                      (if (<= out 0.0)
                          (begin (set! out 0.0)
-                                (set! state env_idle)))
+                           (set! state env_idle)))
                      out)))
             out)))))
 
@@ -3368,20 +3217,20 @@ but v1 and v2 can be computed in parallel"
                      (set! out (+ attackBase (* out attackCoef)))
                      (if (>= out 1.0)
                          (begin (set! out 1.0)
-                                (set! state env_decay)))
+                           (set! state env_decay)))
                      out)
                     ((= state env_decay)
                      (set! out (+ decayBase (* out decayCoef)))
                      (if (<= out sustainLevel)
                          (begin (set! out sustainLevel)
-                                (set! state env_sustain)))
+                           (set! state env_sustain)))
                      out)
                     ((= state env_sustain) out)
                     ((= state env_release)
                      (set! out (+ releaseBase (* out releaseCoef)))
                      (if (<= out 0.0)
                          (begin (set! out 0.0)
-                                (set! state env_idle)))
+                           (set! state env_idle)))
                      out)))
             out)))))
 
@@ -3393,7 +3242,7 @@ but v1 and v2 can be computed in parallel"
   (lambda (start_time:i64 atk_dur:i64 dky_dur:i64 sus_dur:i64 rel_dur:i64 peak_amp:SAMPLE sus_amp:SAMPLE)
     (if (or (= atk_dur 0) (= dky_dur 0))
         (begin (set! dky_dur 0)
-               (set! peak_amp sus_amp)))
+          (set! peak_amp sus_amp)))
     (let ((val:SAMPLE (if (> (+ atk_dur dky_dur) 1) 0.0 peak_amp))
           (t1 (+ atk_dur start_time))
           (t2 (+ atk_dur dky_dur start_time))
@@ -3459,9 +3308,9 @@ but v1 and v2 can be computed in parallel"
         (if (<> prec rec) (set! rhead 0))
         (if (> rec 0)
             (begin (pset! dat rhead x)
-                   (set! rhead (+ 1 rhead))
-                   (if (= chan 0) (set! rec (- rec 1)))
-                   (if (= rhead lgth) (set! rec 0)))
+              (set! rhead (+ 1 rhead))
+              (if (= chan 0) (set! rec (- rec 1)))
+              (if (= rhead lgth) (set! rec 0)))
             (begin (set! rhead 0)))
         (if (<> ploop loop) (set! phead 0))
         (if (<> loop 0)
@@ -3485,4 +3334,4 @@ but v1 and v2 can be computed in parallel"
 
 (define *xtmlib-audio_dsp-loaded* #t)
 
-(impc:aot:insert-footer "xtmaudio_dsp")
+(xtc:aot:insert-footer "xtmaudio_dsp")

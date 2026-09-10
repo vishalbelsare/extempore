@@ -4,15 +4,15 @@
 ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(if *impc:compiler:with-cache* (sys:load "libs/aot-cache/xthread.xtm" 'quiet))
+(if *xtc:globals:with-cache* (sys:load "libs/aot-cache/xthread.xtm" 'quiet))
 (sys:load-preload-check 'xthread)
 (define *xtmlib-xthread-loaded* #t)
 
-(impc:aot:suppress-aot-do (sys:load "libs/base/base.xtm"))
-(impc:aot:insert-forms (sys:load "libs/base/base.xtm" 'quiet))
+(xtc:aot:suppress-aot-do (sys:load "libs/base/base.xtm"))
+(xtc:aot:insert-forms (sys:load "libs/base/base.xtm" 'quiet))
 
-(impc:aot:insert-header "xtmxthread")
-(impc:aot:import-ll "xtmxthread")
+(xtc:aot:insert-header "xtmxthread")
+(xtc:aot:import-ll "xtmxthread")
 
 (bind-func thread_native_call
   (lambda (f:i8*)
@@ -107,10 +107,10 @@
            (,(string->symbol s) ,f)
            (k2:i8* (zalloc 10))
            (t:<[void]*,mzone*>* (zalloc)))
-       (tset! t 0 ,(string->symbol sym))
-       (tset! t 1 z1)
-       (pop_zone)
-       (thread_fork (get_native_fptr thread_native_call_with_zone) (cast t i8*)))))
+      (tset! t 0 ,(string->symbol sym))
+      (tset! t 1 z1)
+      (pop_zone)
+      (thread_fork (get_native_fptr thread_native_call_with_zone) (cast t i8*)))))
 
 (bind-macro
   "spawn a new thread (sync)"
@@ -118,8 +118,8 @@
   (let* ((sym (symbol->string (gensym)))
          (s (string-append sym ":[void]*")))
     `(let ((,(string->symbol s) ,f))
-       (pset! spawnz numspawn (thread_fork (get_native_fptr thread_native_call) (cast ,(string->symbol sym) i8*)))
-       (set! numspawn (+ numspawn 1)))))
+      (pset! spawnz numspawn (thread_fork (get_native_fptr thread_native_call) (cast ,(string->symbol sym) i8*)))
+      (set! numspawn (+ numspawn 1)))))
 
 (bind-macro
   "synchronize threads"
@@ -128,19 +128,19 @@
     (define final '(cast null i8*))
     (if (not (string-contains? (sexpr->string (car (reverse expr))) "spawn"))
         (begin (set! final (car (reverse expr)))
-               (set! expr (reverse (cdr (reverse expr))))))
+          (set! expr (reverse (cdr (reverse expr))))))
     (set! expr (cons 'begin expr))
     (set! expr (replace-all expr '((spawn . syncspawn))))
     (let ((ijk (gensym)))
       `(letz (* 1024 1024)
-         ((numspawn 0)
-          (,ijk 0)
-          (spawnz:i8** (alloc 10000)))
-         ,expr
-         (dotimes (,ijk numspawn)
-           (thread_join (pref spawnz ,ijk)))
-         ;;(printf "syncd %d threads\n" ,ijk)
-         ,final))))
+        ((numspawn 0)
+         (,ijk 0)
+         (spawnz:i8** (alloc 10000)))
+        ,expr
+        (dotimes (,ijk numspawn)
+          (thread_join (pref spawnz ,ijk)))
+        ;;(printf "syncd %d threads\n" ,ijk)
+        ,final))))
 
 (define *xtmlib-xthread-loaded* #t)
-(impc:aot:insert-footer "xtmxthread")
+(xtc:aot:insert-footer "xtmxthread")

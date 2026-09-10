@@ -36,75 +36,76 @@
 #ifndef EXT_THREAD
 #define EXT_THREAD
 
-#ifdef _WIN32
+#include <atomic>
 #include <thread>
-#include <functional>
-#else
-#include "pthread.h"
-#endif
-
 #include <string>
 
 #include "UNIV.h"
 
-namespace extemp
-{
+namespace extemp {
 
-class EXTThread
-{
-public:
+// A named thread running a C-style `void* fn(void*)` entry point (the shape
+// xtlang's thread_fork hands us), with cooperative cancellation.
+//
+// Lifetime: the destructor requests a stop and then joins, so an EXTThread
+// must not be destroyed while its body ignores stopRequested() and never
+// returns -- detach() it first (AudioDevice does this for its worker pool), or
+// have the body poll stopRequested(). Deleting a thread that has already
+// finished (the xthread.xtm join-then-destroy pattern) returns immediately.
+class EXTThread {
+  public:
     typedef void* (*function_type)(void*);
-private:
+
+  private:
     function_type m_function;
-    void*         m_arg;
-    std::string   m_name;
-    bool          m_initialised;
-    bool          m_detached;
-    bool          m_joined;
-    bool          m_subsume; // subsume the current thread
-#ifndef _WIN32
-    pthread_t     m_thread;
-#else
-    std::thread   m_thread;
-#endif
+    void* m_arg;
+    std::string m_name;
+    bool m_subsume = false;  // run the body on the calling thread instead
+    std::atomic<bool> m_stopRequested{false};
+    std::thread m_thread;
+    // The body's native handle, whether it runs on m_thread or on the thread
+    // that subsumed it; setPriority/getPriority need a handle in both cases.
+    std::thread::native_handle_type m_nativeHandle{};
+    bool m_started = false;
 
     static thread_local EXTThread* sm_current;
-public:
-    EXTThread(function_type EntryPoint, void* Arg, const std::string& Name = std::string()): m_function(EntryPoint),
-      m_arg(Arg), m_name(Name), m_initialised(false), m_detached(false), m_joined(false), m_subsume(false) {
-    }
-    ~EXTThread();
 
-    int start(function_type EntryPoint = nullptr, void* Arg = nullptr); // overrides - ugly, from OSC
-    int kill();
+    void* run();
+
+  public:
+    EXTThread(function_type EntryPoint, void* Arg, const std::string& Name = std::string())
+        : m_function(EntryPoint), m_arg(Arg), m_name(Name) {}
+    ~EXTThread();
+    EXTThread(const EXTThread&) = delete;
+    EXTThread& operator=(const EXTThread&) = delete;
+
+    // Optional overrides let a caller supply the entry point at start time
+    // (OSC reuses one EXTThread for either its UDP or TCP server body).
+    int start(function_type EntryPoint = nullptr, void* Arg = nullptr);
+    int kill();  // cooperative: requests stop; the body must poll stopRequested()
+    bool stopRequested() const {
+        return m_stopRequested.load(std::memory_order_acquire);
+    }
     int detach();
     int join();
-    void setSubsume() { m_subsume = true; }
-    bool isRunning() const { return m_initialised; }
-    bool isCurrentThread() { return sm_current == this; }
-    int setPriority(int Priority, bool Realtime);
-    int getPriority() const; //doesn't say if it's realtime or not
-#ifdef _WIN32
-    std::thread& getThread() { return m_thread; }
-#else
-    pthread_t getThread() { return m_thread; }
-#endif
-
-    static void* Trampoline(void* Arg) {
-        auto thread(reinterpret_cast<EXTThread*>(Arg));
-#ifdef __APPLE__ // unforunately apple requires pthread_setname_np in current thread
-        if (!thread->m_name.empty()) {
-            pthread_setname_np(thread->m_name.c_str());
-        }
-#endif
-        sm_current = thread;
-        return thread->m_function(thread->m_arg);
+    void setSubsume() {
+        m_subsume = true;
     }
+    // True once started and until joined or detached.
+    bool isRunning() const {
+        return m_subsume ? m_started : m_thread.joinable();
+    }
+    bool isCurrentThread() const {
+        return sm_current == this;
+    }
+    int setPriority(int Priority, bool Realtime);
+    int getPriority();  // doesn't say if it's realtime or not
+
     static EXTThread* activeThread() {
         return sm_current;
     }
 };
 
-} //End Namespace
+}  // namespace extemp
 
 #endif

@@ -39,12 +39,12 @@
 
 ;; lib-loading config
 
-(if *impc:compiler:with-cache* (sys:load "libs/aot-cache/base.xtm" 'quiet))
+(if *xtc:globals:with-cache* (sys:load "libs/aot-cache/base.xtm" 'quiet))
 (sys:load-preload-check 'base)
 (define *xtmlib-base-loaded* #t)
 
-(impc:aot:insert-header "xtmbase")
-(impc:aot:import-ll "xtmbase")
+(xtc:aot:insert-header "xtmbase")
+(xtc:aot:import-ll "xtmbase")
 ;; (suppress-compiler-messages #f)
 
 ;;;;;;;;;;;;;
@@ -87,10 +87,6 @@
             "audio output callback type")
 (bind-alias DSPMT [SAMPLE,SAMPLE*,i64,i64,SAMPLE*]*
             "(multithreaded) audio output callback type")
-(bind-alias DSPMC [void,float*,float*,i64,i8*]*
-            "buffered audio output callback type")
-(bind-alias DSPMCMT [void,float**,float*,i64,i8*]*
-            "buffered (multithreaded) audio output callback type")
 (bind-func audio_64bit "audiostuff" (lambda () 0:i1))
 
 (bind-val SPI SAMPLE 3.1415926535897932384626433832795028841971693993751058209749
@@ -128,8 +124,8 @@
       (set! NaN (pref (cast n64 double*) 0))
       void)))
 
-;;(impc:aot:do-or-emit (set_float_nans__adhoc_W3ZvaWRd))
-(impc:aot:do-or-emit (xtmX (set_float_nans_)))
+;;(xtc:aot:do-or-emit (set_float_nans__adhoc_W3ZvaWRd))
+(xtc:aot:do-or-emit (xtmX (set_float_nans_)))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -260,7 +256,7 @@
  (size_of type)
  (begin
    (if (symbol? type) (set! type (symbol->string type)))
-   (impc:ir:get-type-size (impc:ir:get-type-from-pretty-str type))))
+   (xtc:codegen:get-type-size (xtc:codegen:get-type-from-pretty-str type))))
 
 (bind-macro
   "increment variable by y"
@@ -335,26 +331,26 @@
  "return native function name for closure"
  (get_native_name closure-name . type)
  (let* ((pair (regex:type-split (symbol->string closure-name) ":"))
-        (base (if (null? (cdr pair)) "" (impc:ir:get-base-type (cadr pair)))))
+        (base (if (null? (cdr pair)) "" (xtc:codegen:get-base-type (cadr pair)))))
    ;; apply any aliases
    (if (and (not (null? (cdr pair)))
-            (impc:ti:typealias-exists? base))
-       (set! base (impc:ir:get-base-type (impc:ir:pretty-print-type (impc:ti:get-typealias-type base)))))
+            (xtc:cache:typealias-exists? base))
+       (set! base (xtc:codegen:get-base-type (xtc:codegen:pretty-print-type (xtc:cache:get-typealias-type base)))))
    (set! closure-name (symbol->string closure-name))
    (if (not (null? (cdr pair)))
        (string-append (car pair) "_adhoc_" (cname-encode base) "_native")
        (if (null? type)
-           (if (and (impc:ti:polyfunc-exists? closure-name)
-                    (= (length (impc:ti:get-polyfunc-candidate-types closure-name)) 1))
-               (let* ((t (impc:ir:pretty-print-type (car (impc:ti:get-polyfunc-candidate-types closure-name))))
-                      (bt (impc:ir:get-base-type t))
+           (if (and (xtc:cache:polyfunc-exists? closure-name)
+                    (= (length (xtc:cache:get-polyfunc-candidate-types closure-name)) 1))
+               (let* ((t (xtc:codegen:pretty-print-type (car (xtc:cache:get-polyfunc-candidate-types closure-name))))
+                      (bt (xtc:codegen:get-base-type t))
                       (fullname (string-append closure-name
                                                "_adhoc_"
                                                (cname-encode bt)
                                                "_native")))
                  fullname)
-               (impc:compiler:print-compiler-error "Try forcing a type? Ambiguous call to get_native_fptr" (string->symbol closure-name)))
-           (let* ((bt (impc:ir:get-base-type (symbol->string (car type))))
+               (xtc:diagnostics:print-compiler-error "Try forcing a type? Ambiguous call to get_native_fptr" (string->symbol closure-name)))
+           (let* ((bt (xtc:codegen:get-base-type (symbol->string (car type))))
                   (fullname (string-append closure-name
                                            "_adhoc_"
                                            (cname-encode bt)
@@ -410,16 +406,16 @@ into any further sexp arguments."
 ;; random ;;
 ;;;;;;;;;;;;
 
-(bind-poly random imp_randf "polymorphic (pseudo)random number generation")
-(bind-poly random imp_randd)
-(bind-poly random imp_rand1_i32)
-(bind-poly random imp_rand2_i32)
-(bind-poly random imp_rand1_i64)
-(bind-poly random imp_rand2_i64)
-(bind-poly random imp_rand1_f)
-(bind-poly random imp_rand2_f)
-(bind-poly random imp_rand1_d)
-(bind-poly random imp_rand2_d)
+(bind-poly random xtc_randf "polymorphic (pseudo)random number generation")
+(bind-poly random xtc_randd)
+(bind-poly random xtc_rand1_i32)
+(bind-poly random xtc_rand2_i32)
+(bind-poly random xtc_rand1_i64)
+(bind-poly random xtc_rand2_i64)
+(bind-poly random xtc_rand1_f)
+(bind-poly random xtc_rand2_f)
+(bind-poly random xtc_rand1_d)
+(bind-poly random xtc_rand2_d)
 
 ;;;;;;;;;;;;;;;;;;
 ;; trigonometry ;;
@@ -455,7 +451,7 @@ into any further sexp arguments."
     void))
 
 ;; NOTE!  push_zone and pop_zone are compiler directives!
-;; i.e. look in llvmir.xtm
+;; i.e. look in xtc-codegen.xtm
 
 (bind-func Zone
   (lambda (size)
@@ -1223,4 +1219,4 @@ If both symbols are null an empty symbol will be returned
 
 (define *xtmlib-base-loaded* #t)
 
-(impc:aot:insert-footer "xtmbase")
+(xtc:aot:insert-footer "xtmbase")

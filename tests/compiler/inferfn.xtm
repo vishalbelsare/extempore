@@ -1,0 +1,185 @@
+;;; tests/compiler/inferfn.xtm -- function-level coverage for the constraint
+;;; inference path (xtc:infer:check-function, the unit behind
+;;; xtc:typecheck:run-type-check).
+;;;
+;;; Where infer.xtm exercises the traversal at the granularity of a single
+;;; expression, this file exercises it at the granularity of a whole FUNCTION
+;;; definition.  For each function body it replicates the driver's phases up to
+;;; t4 (the AST run-type-check receives: mark-returns'd, coercion-run'd,
+;;; pre-closure-convert), runs collect+solve, and asserts the read-back resolves
+;;; EVERY declared var to a concrete type --- no conflict, no residuals.  The
+;;; corpus is organised by form (one function per handler the traversal covers),
+;;; so a constraint-emission regression names the form it broke.
+;;;
+;;; (This file began as the increment-3 shadow comparison against the old
+;;; candidate-list checker; with that path deleted --- TASK-059 increment 4 ---
+;;; the constraint engine is its own oracle and the corpus pins full
+;;; resolution directly.)
+
+(sys:load "libs/core/test.xtm")
+(sys:load "runtime/xtc-solve.xtm")
+(sys:load "runtime/xtc-infer.xtm")
+
+;; Replicate the driver's phases up to (vars forced-types t4) for one function
+;; definition --- exactly the triple xtc:typecheck:run-type-check is called with.
+(define inferfn:prep
+  (lambda (symname code . args)
+    (let* ((syn (xtc:driver:syntactic-phase symname code))
+           (t1 (car syn))
+           (cc (cadr syn))
+           (ann (xtc:driver:annotation-phase t1 symname))
+           (t2 (car ann))
+           (vars (cadr ann))
+           (forced-types (apply xtc:typecheck:handle-forced-types t1 (append cc args)))
+           (t4 (xtc:typecheck:coercion-run t2 forced-types)))
+      ;; the outer (ret-> symname ...) marker references the function name,
+      ;; which the live driver has registered; add it here too.
+      (if (not (hashtable-ref vars symname))
+          (hashtable-set! vars symname (xtc:typecheck:make-uf-cell '())))
+      (list vars forced-types t4))))
+
+;; A var's type as the assertion reads it: a 1-element candidate list unwraps
+;; to its sole member.
+(define inferfn:norm
+  (lambda (t) (if (and (list? t) (= (length t) 1)) (car t) t)))
+
+;; The declared vars the constraint path FAILED to resolve to a concrete type:
+;; 'conflict if the solve itself fails, otherwise every var-table symbol whose
+;; read-back entry is missing or non-concrete.  An empty result certifies the
+;; function resolved completely --- the contract codegen relies on.  The
+;; symname itself is excluded: it is a prep artefact (the live driver
+;; registers and resolves the function name through the cache, not the
+;; var-table read-back); the function's signature reads back through its
+;; anonymous-lambda var instead.
+(define inferfn:residuals
+  (lambda (symname code . args)
+    (let* ((p (apply inferfn:prep symname code args))
+           (alist (xtc:infer:check-function (car p) (cadr p) (caddr p))))
+      (if (not alist)
+          'conflict
+          (cl:remove
+            #f
+            (map (lambda (sym)
+                   (let ((e (assq sym alist)))
+                     (if (or (eq? sym symname)
+                             (and e (xtc:codegen:type? (inferfn:norm (cdr e)))))
+                         #f
+                         sym)))
+                 (hashtable-keys (car p))))))))
+
+;; A couple of monomorphic globals so a function body can call out.
+(bind-func inferfn_add_i32 (lambda (a:i32 b:i32) (+ a b)))
+(bind-func inferfn_pos     (lambda (x:double) (> x 0.0)))
+
+;; A named tuple type for the aggregate cases.
+(bind-type ifn_pair <i64,double>)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; full resolution     ;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(xtmtest-result (inferfn:residuals 'tf_add1 '(lambda (x:i64) (+ x 1)))
+                '() "fn-add1")
+(xtmtest-result (inferfn:residuals 'tf_add2 '(lambda (x:i64 y:i64) (+ x y)))
+                '() "fn-add-two")
+(xtmtest-result (inferfn:residuals 'tf_fadd '(lambda (a:double b:double) (* a b)))
+                '() "fn-float-mul")
+(xtmtest-result (inferfn:residuals 'tf_cmp  '(lambda (x:i64) (< x 0)))
+                '() "fn-compare-returns-bool")
+(xtmtest-result (inferfn:residuals 'tf_if   '(lambda (x:i64) (if (< x 0) 0 x)))
+                '() "fn-if-branches")
+(xtmtest-result (inferfn:residuals 'tf_let  '(lambda (x:i64) (let ((y:i64 (+ x 1))) (+ y y))))
+                '() "fn-let-local")
+(xtmtest-result (inferfn:residuals 'tf_call '(lambda (x:i32) (inferfn_add_i32 x 1)))
+                '() "fn-global-call")
+(xtmtest-result (inferfn:residuals 'tf_nest '(lambda (x:double) (if (inferfn_pos x) 1 0)))
+                '() "fn-global-call-in-if")
+(xtmtest-result (inferfn:residuals 'tf_comp '(lambda (x:i64) (let ((a:i64 (+ x 1))) (if (< a 10) a (+ a 1)))))
+                '() "fn-composed")
+
+;; memory / aggregate forms (stage 3b): allocation, tuple build + read (anonymous
+;; and named), set!, null?, pointer read/write.
+(xtmtest-result (inferfn:residuals 'tf_tup
+                                   '(lambda (x:i64 y:double)
+                                     (let ((t:<i64,double>* (salloc)))
+                                       (tset! t 0 x) (tset! t 1 y) (tref t 0))))
+                '() "fn-tuple-build-read")
+(xtmtest-result (inferfn:residuals 'tf_tup1
+                                   '(lambda (x:i64 y:double)
+                                     (let ((t:<i64,double>* (salloc)))
+                                       (tset! t 0 x) (tset! t 1 y) (tref t 1))))
+                '() "fn-tuple-field1")
+(xtmtest-result (inferfn:residuals 'tf_named '(lambda (p:ifn_pair*) (tref p 0)))
+                '() "fn-named-tuple-field0")
+(xtmtest-result (inferfn:residuals 'tf_named1 '(lambda (p:ifn_pair*) (tref p 1)))
+                '() "fn-named-tuple-field1")
+(xtmtest-result (inferfn:residuals 'tf_heap
+                                   '(lambda (x:i64) (let ((t:<i64,i64>* (halloc))) (tset! t 0 x) (tref t 0))))
+                '() "fn-heap-alloc")
+(xtmtest-result (inferfn:residuals 'tf_set '(lambda (x:i64) (let ((y:i64 0)) (set! y x) y)))
+                '() "fn-set-bang")
+(xtmtest-result (inferfn:residuals 'tf_null '(lambda (p:i64*) (null? p)))
+                '() "fn-null-pred")
+(xtmtest-result (inferfn:residuals 'tf_pref '(lambda (p:i64*) (pref p 0)))
+                '() "fn-pointer-ref")
+(xtmtest-result (inferfn:residuals 'tf_pset '(lambda (p:i64* x:i64) (pset! p 0 x)))
+                '() "fn-pointer-set")
+
+;; control / misc forms (stage 3b cont.): while, dotimes, string literal,
+;; numeric conversion, printf, closure application, array.
+(xtmtest-result (inferfn:residuals 'tf_while
+                                   '(lambda (n:i64) (let ((i:i64 0)) (while (< i n) (set! i (+ i 1))) i)))
+                '() "fn-while")
+;; the dotimes counter is not a binding site on either path --- both error on an
+;; undeclared counter --- so it is declared in the let, the documented usage
+(xtmtest-result (inferfn:residuals 'tf_dot
+                                   '(lambda (n:i64) (let ((s:i64 0) (i:i64 0)) (dotimes (i n) (set! s (+ s i))) s)))
+                '() "fn-dotimes-declared-counter")
+(xtmtest-result (inferfn:residuals 'tf_str '(lambda () "hello"))
+                '() "fn-string-literal")
+(xtmtest-result (inferfn:residuals 'tf_conv '(lambda (x:i64) (convert x double)))
+                '() "fn-convert")
+(xtmtest-result (inferfn:residuals 'tf_printf '(lambda (x:i64) (printf "%d" x)))
+                '() "fn-printf")
+(xtmtest-result (inferfn:residuals 'tf_apply '(lambda (f:[i64,i64]* x:i64) (f x)))
+                '() "fn-closure-apply")
+(xtmtest-result (inferfn:residuals 'tf_arr
+                                   '(lambda (n:i64) (let ((a:|4,i64|* (salloc))) (aset! a 0 n) (aref a 0))))
+                '() "fn-array")
+(xtmtest-result (inferfn:residuals 'tf_sqrt '(lambda (x:double) (sqrt x)))
+                '() "fn-math-intrinsic")
+(xtmtest-result (inferfn:residuals 'tf_pow '(lambda (x:double y:double) (pow x y)))
+                '() "fn-math-intrinsic-binary")
+(xtmtest-result (inferfn:residuals 'tf_mod '(lambda (a:i64 b:i64) (modulo a b)))
+                '() "fn-modulo")
+(xtmtest-result (inferfn:residuals 'tf_spr '(lambda (s:i8* x:i64) (sprintf s "%d" x)))
+                '() "fn-sprintf")
+
+;; the from-source sweep's regression cases: a one-armed if (its value is the
+;; then-branch's, never car-of-nil), pref-ptr (pointer-ref-ptr keeps the
+;; pointer's own type), a global variable read and write (resolved through the
+;; cache, NOT an alist local), SIMD vector math at mixed pointer depth and
+;; vshuffle (both yield the VALUE vector), and an i8-typed comparison against an
+;; int literal (the literal's viability class reaches the 8-bit widths).
+(xtmtest-result (inferfn:residuals 'tf_if1
+                                   '(lambda (x:i64) (let ((y:i64 0)) (if (> x 0) (set! y x)) y)))
+                '() "fn-one-armed-if")
+(xtmtest-result (inferfn:residuals 'tf_prefptr
+                                   '(lambda (p:double* n:i64) (pref-ptr p n)))
+                '() "fn-pref-ptr")
+(bind-val inferfn_gv i64 7)
+(xtmtest-result (inferfn:residuals 'tf_gread '(lambda (x:i64) (+ x inferfn_gv)))
+                '() "fn-global-read")
+(xtmtest-result (inferfn:residuals 'tf_gwrite '(lambda (x:i64) (set! inferfn_gv x) inferfn_gv))
+                '() "fn-global-write")
+(xtmtest-result (inferfn:residuals 'tf_vmath
+                                   '(lambda (a:/4,float/* b:/4,float/*)
+                                     (let ((v:/4,float/ (* (pref a 0) b))) v)))
+                '() "fn-vector-math-mixed-depth")
+(xtmtest-result (inferfn:residuals 'tf_vshuf
+                                   '(lambda (a:/4,float/*)
+                                     (let ((v:/4,float/ (vshuffle a null 0 0 1 1))) v)))
+                '() "fn-vector-shuffle")
+(xtmtest-result (inferfn:residuals 'tf_i8cmp
+                                   '(lambda (s:i8* i:i64) (if (= (pref s i) 32) 1 0)))
+                '() "fn-i8-literal-compare")

@@ -14,17 +14,17 @@
 ;;; Code:
 
 ;; lib-loading config
-(if *impc:compiler:with-cache* (sys:load "libs/aot-cache/instruments.xtm" 'quiet))
+(if *xtc:globals:with-cache* (sys:load "libs/aot-cache/instruments.xtm" 'quiet))
 (sys:load-preload-check 'instruments)
 
 (define *xtmlib-instruments-loaded* #t)
 
-(impc:aot:suppress-aot-do
- (sys:load "libs/core/audio_dsp.xtm"))
-(impc:aot:insert-forms (sys:load "libs/core/audio_dsp.xtm" 'quiet))
+(xtc:aot:suppress-aot-do
+  (sys:load "libs/core/audio_dsp.xtm"))
+(xtc:aot:insert-forms (sys:load "libs/core/audio_dsp.xtm" 'quiet))
 
-(impc:aot:insert-header "xtminstruments")
-(impc:aot:import-ll "xtminstruments")
+(xtc:aot:insert-header "xtminstruments")
+(xtc:aot:import-ll "xtminstruments")
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -209,8 +209,8 @@
 
 (bind-func xtm_play
   (lambda (offset:double bsched:[void]* inst:[SAMPLE,SAMPLE,i64,i64,SAMPLE*]*
-                    pitch:double vol:double dur:double
-                    num:i64 mem:SAMPLE*)
+                         pitch:double vol:double dur:double
+                         num:i64 mem:SAMPLE*)
     (let ((bpm (bsched.bpm)))
       (xtm_play_note (+ (now) (dtoi64 (* offset (/ 60.0 bpm) SRd)))
                      inst
@@ -224,8 +224,8 @@
 ;; load the scheme macros (e.g. bind-instrument)
 (sys:load "libs/core/instruments-scm.xtm")
 ;; make sure we load them with AOT-compiled code as well
-(impc:aot:insert-forms
- (sys:load "libs/core/instruments-scm.xtm"))
+(xtc:aot:insert-forms
+  (sys:load "libs/core/instruments-scm.xtm"))
 
 ;; load global instrument params (and build into aot)
 (sys:load "libs/core/instruments/instrument_params.xtm")
@@ -238,6 +238,6 @@
 (sys:load "libs/core/instruments/dlogue.xtm")
 (sys:load "libs/core/instruments/analogue_midi.xtm")
 
-(impc:aot:insert-footer "xtminstruments")
+(xtc:aot:insert-footer "xtminstruments")
 
 (define *xtmlib-instruments-loaded* #t)

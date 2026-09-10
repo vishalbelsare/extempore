@@ -35,51 +35,28 @@
 
 #pragma once
 
-#include <Scheme.h>
+#include <SchemeS7.h>
 #include <EXTZones.h>
-#include <EXTMutex.h>
-#include <BranchPrediction.h>
+#include <EXTRuntime.h>
 #include <UNIV.h>
 
 #include <vector>
 #include <string>
+#include <string_view>
 #include <memory>
 
+#include "llvm/ExecutionEngine/Orc/Core.h"
+#include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
+#include "llvm/Support/Error.h"
 
 struct _llvm_callback_struct_ {
-    void(*fptr)(void*,llvm_zone_t*);
+    void (*fptr)(void*, llvm_zone_t*);
     void* dat;
     llvm_zone_t* zone;
 };
 
 struct closure_address_table;
 
-extern "C"
-{
-
-const char* llvm_scheme_ff_get_name(foreign_func ff);
-void llvm_scheme_ff_set_name(foreign_func ff,const char* name);
-
-void llvm_destroy_zone_after_delay(llvm_zone_t* zone, uint64_t delay);
-
-pointer llvm_scheme_env_set(scheme* _sc, char* sym);
-bool llvm_check_valid_dot_symbol(scheme* sc, char* symbol);
-bool regex_split(char* str, char** a, char** b);
-
-static inline uint64_t string_hash(const char* str)
-{
-    uint64_t result(0);
-    unsigned char c;
-    while((c = *(str++))) {
-        result = result * 33 + uint8_t(c);
-    }
-    return result;
-}
-
-EXPORT double imp_randd();
-EXPORT int64_t imp_rand1_i64(int64_t a);
-
-}
 
 ///////////////////////////////////////////////////
 // this added for dogdy continuations support
@@ -94,44 +71,69 @@ class GlobalVariable;
 class GlobalValue;
 class Function;
 class StructType;
-class ModuleProvider;
-class SectionMemoryManager;
-class ExecutionEngine;
+class LLVMContext;
 
-namespace legacy
-{
+namespace orc {
+class LLJIT;
+class ThreadSafeContext;
+}  // namespace orc
 
-class PassManager;
+}  // namespace llvm
 
-}
+namespace extemp {
 
-} // end llvm namespace
+namespace EXTLLVM {
 
-namespace extemp
-{
+uint64_t getFunctionAddress(std::string_view name);
+void registerAdhocAlias(std::string_view fullName);
 
-namespace EXTLLVM
-{
+// ORC JIT
+extern std::unique_ptr<llvm::orc::LLJIT> JIT;
 
-uint64_t getSymbolAddress(const std::string&);
-void addModule(llvm::Module* m);
+extern std::unique_ptr<llvm::orc::ThreadSafeContext> TSC;
 
-extern llvm::ExecutionEngine* EE; // TODO: nobody should need this (?)
-extern llvm::Module* M;
+llvm::orc::ThreadSafeContext& getThreadSafeContext();
+
+// Erase a symbol defined by an earlier module (lazily, see EXTLLVM.cpp) or an
+// absolute symbol registered with defineAbsoluteSymbol. False if not found.
+bool removeSymbol(const std::string& name);
+void removeFromGlobalMap(const std::string& name);
+// Define, or redefine, a symbol resolving to a fixed process address.
+llvm::Error defineAbsoluteSymbol(std::string_view Name, void* Addr);
+
+// What a module contributes to the JIT: strong definitions it exports, external
+// symbols it uses, and whether any export is a global variable.
+struct ModuleSymbols {
+    std::vector<std::string> exports;
+    std::vector<std::string> imports;
+    bool definesGlobals = false;
+};
+ModuleSymbols collectModuleSymbols(const llvm::Module& M);
+
+// Add a compiled module under its own resource tracker. Metadata is the clone
+// exposed through getModules()/getGlobalValue(); it is released with the code.
+llvm::Error addTrackedModule(llvm::orc::ThreadSafeModule TSM, ModuleSymbols Symbols,
+                             std::unique_ptr<llvm::Module> Metadata);
+// Add a module for a single use (the llvm:run call stubs); pass the tracker
+// back to removeTransientModule once the call has returned.
+llvm::Expected<llvm::orc::ResourceTrackerSP> addTransientModule(llvm::orc::ThreadSafeModule TSM);
+void removeTransientModule(llvm::orc::ResourceTrackerSP RT);
+
 extern int64_t LLVM_COUNT;
 extern bool OPTIMIZE_COMPILES;
 extern bool VERIFY_COMPILES;
-extern llvm::legacy::PassManager* PM;
-extern llvm::legacy::PassManager* PM_NO;
+extern int OPTIMIZATION_LEVEL;  // 0=O0, 1=O1, 2=O2, 3=O3
 extern std::vector<llvm::Module*> Ms;
 
 void initLLVM();
 const llvm::Function* getFunction(const char* name);
 const llvm::GlobalVariable* getGlobalVariable(const char* name);
 const llvm::GlobalValue* getGlobalValue(const char* name);
-inline std::vector<llvm::Module*>& getModules() { return Ms; } // not going to protect these!!!
-EXPORT const char* llvm_disassemble(const unsigned char*  Code, int Syntax);
+inline std::vector<llvm::Module*>& getModules() {
+    return Ms;
+}  // not going to protect these!!!
+std::string llvm_disassemble(const unsigned char* Code, int Syntax);
 
-}
+}  // namespace EXTLLVM
 
-}
+}  // namespace extemp

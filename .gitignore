@@ -1,4 +1,4 @@
-# extmpore binary executable
+# extempore binary executable
 extempore
 extempore.exe
 extempore.lib
@@ -7,48 +7,27 @@ extempore.dll
 extempore.dylib
 libextempore.so
 
-# boost
-/boost
+# local dev state (per-session assistants, sanitizer builds)
+.remember/
+/build-asan/
+/build-ubsan/
+/build-tsan/
 
 # cmake & other build tools
 /build
-/buildlib
-/cmake-build
+/Testing
 /out # this is where MSVS puts the CMake build stuff
-/extras/cmake/aot.cmake
-/extras/cmake/aot_extended.cmake
 
 # AOT-compiled libraries
 /libs/aot-cache
-/libs/aot-cache.bak
-
 
 # Windows dlls/libs
 /libs/platform-shlibs
-/libs/builds
-/libs/CEF
 extempore.pdb
 extempore.ilk
 
-# Horde3D
-/Horde3D
-Horde3D.dll
-Horde3dUtils.dll
-
-# Bullet
-BulletCollision.dll
-BulletDynamics.dll
-
 # assets
 /assets
-
-# ignore extempore keylogs
-/keylogs
-
-# mode for highlighing LLVM IR files
-# available from http://llvm.org/
-/extras/llvm-mode.el
-/extras/posn-on-screen.el
 
 # extempore scratch file
 /scratch.xtm
@@ -59,21 +38,13 @@ BulletDynamics.dll
 # DS_Store
 .DS_Store
 
-# Sphinx
-/docs/_build
-/docs/_build_html
-
-# src
-/src/portaudio/src/hostapi/asio
+# Astro docs
+docs/node_modules/
+docs/dist/
+docs/.astro/
 
 # llvm
 /llvm
-
-# aot
-/extras/cmake/aot.cmake
-/extras/cmake/aot_external_audio.cmake
-/extras/cmake/aot_external_graphics.cmake
-/extras/cmake/aot_external.cmake
 
 # vscode
 .vscode
@@ -105,11 +76,9 @@ CMakeSettings.json
 # ignore data
 /data
 
-# ignore Plugins
-/Plugins
-
-# ignore toml
+# ignore toml (except mise.toml)
 /*.toml
+!mise.toml
 
 # ccls is a clang-based LSP server
 .ccls-cache/*
